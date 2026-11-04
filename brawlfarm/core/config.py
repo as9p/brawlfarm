@@ -51,6 +51,21 @@ ADB_PATH = os.environ.get("BRAWL_ADB_PATH", r"C:\Program Files\BlueStacks_nxt\HD
 # Brawl Stars Android package (for relaunch / freeze recovery).
 BS_PACKAGE = "com.supercell.brawlstars"
 
+# --- game client auto-update (2026-11-04) -------------------------------------------
+# When a stuck run's first force-stop + relaunch does not help, recover() opens the Brawl
+# Stars page in the Play Store ONCE per run. An "Update" button means a new client is out:
+# tap it, wait for the installed versionName to change, relaunch. OCR-driven tap outside
+# the game (safety rail: verify then act). Lines containing a STORE_NEVER_TAP word are
+# never tapped; "Uninstall" sits next to "Update" on the store page.
+PLAY_STORE_PACKAGE = "com.android.vending"
+STORE_UPDATE_NEEDLE = "update"  # whole OCR line, case-insensitive
+STORE_NEVER_TAP = ("uninstall",)
+STORE_OPEN_TIMEOUT_S = 15  # wait for the store to reach the foreground
+STORE_SETTLE_S = 3.0  # let the store page render before the screenshot
+GAME_UPDATE_TIMEOUT_S = 600  # wait this long for the new version to install
+GAME_UPDATE_POLL_S = 15
+GAME_UPDATE_ON_ATTEMPT = 2  # recovery attempt that triggers the once-per-run check
+
 load_dotenv(HOME_DIR / ".env")
 
 

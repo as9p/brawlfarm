@@ -357,6 +357,49 @@ def current_package() -> str:
     return m.group(1) if m else ""
 
 
+# Package names reach the DEVICE shell (adb shell re-parses its arguments), so gate them
+# to the characters a real Android package name can hold before building a command.
+_PACKAGE_RE = re.compile(r"[A-Za-z0-9_.]+")
+
+
+def _checked_package(package: str) -> str:
+    s = str(package)
+    if not _PACKAGE_RE.fullmatch(s):
+        raise ValueError(f"refused package name {s!r}: characters outside the safe set")
+    return s
+
+
+def open_store_page(package: str) -> None:
+    """Open ``package``'s Play Store page (game auto-update). The URL is single-quoted
+    because the device shell would treat ``?`` as a glob character."""
+    pkg = _checked_package(package)
+    _run(
+        [
+            "-s",
+            config.ADB_SERIAL,
+            "shell",
+            "am",
+            "start",
+            "-a",
+            "android.intent.action.VIEW",
+            "-d",
+            f"'market://details?id={pkg}'",
+        ]
+    )
+
+
+def package_version(package: str) -> str | None:
+    """Installed ``versionName`` of ``package``, or None when adb fails or the package
+    is missing. Used to confirm a Play Store update actually landed."""
+    pkg = _checked_package(package)
+    try:
+        out = _run(["-s", config.ADB_SERIAL, "shell", "dumpsys", "package", pkg])
+    except AdbError:
+        return None
+    m = re.search(r"versionName=(\S+)", out)
+    return m.group(1) if m else None
+
+
 def screen_size() -> tuple[int, int]:
     """Return (width, height) of the BlueStacks display in pixels."""
     out = _run(["-s", config.ADB_SERIAL, "shell", "wm", "size"])

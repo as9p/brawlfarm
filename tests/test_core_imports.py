@@ -18,6 +18,7 @@ MODULES = [
     "datalog",
     "events",
     "farmplan",
+    "game_update",
     "janitor",
     "jsonio",
     "match_vision",
