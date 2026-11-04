@@ -340,6 +340,8 @@ more than the 8 used for a smoke test), `--batch` the number of images per train
 `--accum` the number of steps to accumulate gradients over before updating the model, which
 lets a small GPU behave like a bigger one. On an RTX 4080 SUPER, 8 epochs on a tiny set took
 about 50 seconds; a real run takes much longer. Output goes to `runs/<YYYYmmdd-HHMMSS>/`.
+Right before training starts, `train.py` prints the device it will train on, `cuda` with the
+GPU name or `cpu` with a loud warning, because a CPU run is very slow and can take hours.
 
 Tap anchors (the buttons, cards and panels the controller taps) are rare in the frames, so
 training **oversamples** them: every training image that holds at least one tap-anchor box goes

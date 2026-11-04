@@ -72,6 +72,28 @@ def describe(summary: dict) -> None:
         print("")
 
 
+def describe_device() -> None:
+    """Print the device rfdetr will train on, and shout when it is the CPU: a CPU run takes hours.
+
+    This only reports. rfdetr still picks the device itself, from the same torch check.
+    """
+    try:
+        import torch  # here, like rfdetr, so the tests run without torch
+    except ImportError:
+        print("training device unknown: torch does not import")
+        return
+    if torch.cuda.is_available():
+        print(f"training device cuda ({torch.cuda.get_device_name()})")
+        return
+    print("training device cpu")
+    print("")
+    print("WARNING: torch sees no CUDA GPU, so this run trains on the CPU.")
+    print("WARNING: CPU training is very slow: a 60-epoch run can take many hours.")
+    print("WARNING: To train on the GPU, set up the NVIDIA GPU and driver that the play-gpu")
+    print("WARNING: extra needs, as docs/install.md describes, then run this again.")
+    print("")
+
+
 def repeat_count(text: str) -> int:
     """An argparse type for --anchor-repeat: a whole number, 1 or more."""
     try:
@@ -183,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from rfdetr import RFDETRNano  # here, so a missing split fails before torch loads
 
+    describe_device()
     RFDETRNano().train(
         dataset_dir=str(dataset),
         epochs=args.epochs,

@@ -84,7 +84,18 @@ def fake_rfdetr(monkeypatch):
     module = types.ModuleType("rfdetr")
     module.RFDETRNano = Nano
     monkeypatch.setitem(sys.modules, "rfdetr", module)
+    # No torch either, unless a test hands in a stand-in: the device print must not load it.
+    monkeypatch.setitem(sys.modules, "torch", None)
     return calls
+
+
+def _fake_torch(monkeypatch, cuda: bool, name: str = "NVIDIA GeForce RTX 4080 SUPER") -> None:
+    """torch as a stand-in that sees a CUDA GPU or does not, with no GPU and no real torch."""
+    module = types.ModuleType("torch")
+    module.cuda = types.SimpleNamespace(
+        is_available=lambda: cuda, get_device_name=lambda device=None: name
+    )
+    monkeypatch.setitem(sys.modules, "torch", module)
 
 
 def test_the_fixture_has_one_tap_anchor_class():
@@ -209,3 +220,42 @@ def test_main_refuses_an_anchor_repeat_below_one(tmp_path, value, fake_rfdetr):
         train.main(["--root", str(tmp_path), "--anchor-repeat", value])
     assert raised.value.code == 2
     assert fake_rfdetr == []
+
+
+def test_describe_device_names_the_gpu_with_cuda(monkeypatch, capsys):
+    _fake_torch(monkeypatch, cuda=True)
+    train.describe_device()
+    out = capsys.readouterr().out
+    assert "training device cuda (NVIDIA GeForce RTX 4080 SUPER)" in out
+    assert "WARNING" not in out
+
+
+def test_describe_device_warns_loudly_on_the_cpu(monkeypatch, capsys):
+    _fake_torch(monkeypatch, cuda=False)
+    train.describe_device()
+    out = capsys.readouterr().out
+    assert "training device cpu" in out
+    warnings = [line for line in out.splitlines() if line.startswith("WARNING")]
+    assert len(warnings) >= 3
+    text = " ".join(warnings)
+    assert "very slow" in text
+    assert "play-gpu" in text
+    assert "docs/install.md" in text
+
+
+def test_describe_device_does_not_crash_without_torch(monkeypatch, capsys):
+    monkeypatch.setitem(sys.modules, "torch", None)
+    train.describe_device()
+    assert "training device unknown" in capsys.readouterr().out
+
+
+def test_main_prints_the_device_right_before_training(tmp_path, fake_rfdetr, monkeypatch, capsys):
+    _fake_torch(monkeypatch, cuda=False)
+    nano = sys.modules["rfdetr"].RFDETRNano
+    monkeypatch.setattr(nano, "train", lambda self, **kwargs: print("training starts"))
+    _write_coco(tmp_path)
+    _write_split(tmp_path)
+    assert train.main(["--root", str(tmp_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert out.index("tap anchor") < out.index("training device cpu") < out.index("training starts")
