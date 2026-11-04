@@ -1,18 +1,32 @@
-"""Score an exported model against what the farm's own templates say about every frame on disk.
+"""Score an exported model on the held-out test frames against what the farm's templates say.
 
 The templates are the only truth this kit has outside the labelled set, and they are the same
 truth the farm loop already trusts, so a model is judged by them before it is ever allowed to
 drive: per template class and per frame, the model and the template matcher either agree or
-they do not. The bar is the never-tap rail, not the average: one detection of a tappable
-control on a frame where the template sees none fails the whole report, because a tap on the
-wrong pixel spends gems or leaves a queue. Missing a control is only a slow loop.
+they do not. The frames are the test split of the COCO build the model was trained from, never
+the frames it trained on, because a model scored on its own training set is marking its own
+homework.
+
+The report ends in one of three verdicts, and the exit code says which:
+
+  PASS (0)          every tap anchor with a template was measured and found often enough,
+                    and none was detected where the templates see none.
+  FAIL (1)          a tap anchor detected where the templates see none, or beside the one they
+                    see: a tap on the wrong pixel spends gems or leaves a queue. Or a tap anchor
+                    with at least --min-truth template boxes whose recall is under --min-recall.
+  INCONCLUSIVE (2)  nothing here proves the model safe: a tap anchor with too few template
+                    boxes to measure, no frame scored, no COCO build, a smoke model, or a scan
+                    of whole folders that may hold training frames.
+
+FAIL wins over INCONCLUSIVE: a false positive is real wherever it was seen.
 
 Three tap anchors have no template behind them (skull_star, team_up_panel, event_tab), so
-nothing here can tell a good detection of one from a bad one. Those are listed on their own
-and decide nothing; they are for the owner to look at.
+nothing here can tell a good detection of one from a bad one, or count one as missed. Those are
+listed as having no label source and decide nothing; they are for the owner to look at.
 
     uv run python tools/play/score.py
-    uv run python tools/play/score.py --frames D:/shots --cuda
+    uv run python tools/play/score.py --cuda --min-truth 50
+    uv run python tools/play/score.py --frames D:/shots
 """
 
 from __future__ import annotations
@@ -32,16 +46,26 @@ from brawlfarm.core import vision
 from tools.play import classes, dataset, prelabel, thresholds
 
 SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
+PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
+EXIT_CODES = {PASS: 0, FAIL: 1, INCONCLUSIVE: 2}
+# Below this many template boxes a recall swings on a frame or two, so it proves nothing.
+MIN_TRUTH = 30
+MIN_RECALL = 0.5
+# tap anchors a template labels: the only ones whose misses this report can count
+LABELLED: frozenset[str] = classes.TAP_ANCHORS & set(classes.TEMPLATE_CLASS.values())
 # tap anchors the templates cannot judge: a detection of one is reported, never counted
 UNVERIFIABLE: frozenset[str] = classes.TAP_ANCHORS - set(classes.TEMPLATE_CLASS.values())
+CUDA = "CUDAExecutionProvider"
+SCAN = "a folder scan, not the held-out test split: the model may have trained on these frames"
 
 
 def load_model(models: Path, *, cuda: bool = False) -> tuple[ort.InferenceSession, dict]:
     """play.onnx and play.json out of a models folder, on the CPU provider unless cuda is asked.
 
-    The providers the session really got are printed rather than assumed: onnxruntime falls back
-    to the CPU without a word when the CUDA libraries are missing, and a report that took an hour
-    on the CPU while the owner thought it was on the GPU is a report nobody trusts twice.
+    The providers the session really got are printed rather than assumed, and a cuda request
+    that did not get CUDA stops here: onnxruntime falls back to the CPU without a word when the
+    CUDA libraries are missing, and a report that took an hour on the CPU while the owner
+    thought it was on the GPU is a report nobody trusts twice.
     """
     meta = json.loads((models / "play.json").read_text(encoding="utf-8"))
     providers = ["CPUExecutionProvider"]
@@ -51,9 +75,16 @@ def load_model(models: Path, *, cuda: bool = False) -> tuple[ort.InferenceSessio
                 ort.preload_dlls()
             except Exception as exc:  # an old or CPU-only build: say so and carry on
                 print(f"preload_dlls failed ({exc}); trying CUDA anyway")
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        providers = [CUDA, "CPUExecutionProvider"]
     session = ort.InferenceSession(str(models / "play.onnx"), providers=providers)
-    print(f"providers: {', '.join(session.get_providers())}")
+    active = session.get_providers()
+    print(f"providers: {', '.join(active)}")
+    if cuda and CUDA not in active:
+        raise SystemExit(
+            f"--cuda was asked for, but onnxruntime gave only {', '.join(active)}. Install the "
+            "play-gpu extra, see docs/install.md; if it is installed already, the CPU "
+            "onnxruntime package won the install order, and docs/install.md has the fix."
+        )
     return session, meta
 
 
@@ -127,13 +158,24 @@ def compare(detections: list[dict], truth: dict[str, dict | None], iou_min: floa
     return verdicts
 
 
-def report(rows: list[dict]) -> dict:
-    """The verdicts of every frame summed per class, plus the never-tap count and the pass flag.
+def report(
+    rows: list[dict],
+    *,
+    min_truth: int = MIN_TRUTH,
+    min_recall: float = MIN_RECALL,
+    caveats: list[str] | None = None,
+) -> dict:
+    """The verdicts of every frame summed per class and per tap anchor, then the one verdict.
 
     A precision or a recall with nothing under it is 0.0, the way export.py reports one: a class
     the model never detected has not shown anything, and printing 1.0 there would read as perfect.
     A tp+extra is one of each: the control was found, and a second box was invented beside it.
-    No frame at all is not a pass: an empty report proves nothing, so it fails.
+
+    The truth of a tap anchor is its template boxes, tp plus fn. Fewer than min_truth of them
+    and its recall proves nothing, which makes the report INCONCLUSIVE, as does no frame at all
+    or any caveat the caller passes in (a smoke model, frames that may be training ones). A
+    never-tap false positive, or a measured recall under min_recall, is a FAIL however little
+    else could be measured. The reasons say why the verdict is not PASS.
     """
     totals: dict[str, Counter[str]] = {}
     for row in rows:
@@ -157,11 +199,101 @@ def report(rows: list[dict]) -> dict:
         for cls, count in totals.items()
         if cls in classes.TAP_ANCHORS
     )
+
+    failed: list[str] = []
+    unsure = list(caveats or [])
+    if bad:
+        failed.append(f"{bad} tap anchor detection(s) where the templates see none")
+    if not rows:
+        unsure.append("no frame was scored, so nothing is proven")
+    anchors = {}
+    for cls in sorted(LABELLED):
+        count = per_class.get(cls, {"tp": 0, "fp": 0, "fn": 0, "recall": 0.0})
+        truth = count["tp"] + count["fn"]
+        anchors[cls] = {
+            "truth": truth,
+            "tp": count["tp"],
+            "fn": count["fn"],
+            "fp": count["fp"],
+            "recall": count["recall"],
+        }
+        if truth < min_truth:
+            unsure.append(f"{cls} has {truth} template box(es), fewer than {min_truth} to measure")
+        elif count["tp"] / truth < min_recall:
+            failed.append(f"{cls} recall {count['recall']} on {truth} is under {min_recall}")
+    verdict = FAIL if failed else INCONCLUSIVE if unsure else PASS
     return {
+        "verdict": verdict,
+        "pass": verdict == PASS,
+        "fail_reasons": failed,
+        "inconclusive_reasons": unsure,
         "classes": per_class,
+        "tap_anchors": anchors,
+        "no_label_source": sorted(UNVERIFIABLE),
         "tap_anchor_false_positives": bad,
-        "pass": bool(rows) and bad == 0,
     }
+
+
+def held_out(root: Path, meta: dict) -> tuple[list[tuple[str, Path]], list[str]]:
+    """The test split of the COCO build as (name, path) pairs, and why it cannot prove a pass.
+
+    coco.py copies every frame of a split byte for byte, under its own file name, into
+    `coco/<split>/` and lists it in that folder's `_annotations.coco.json`, so the copy in
+    `coco/test/` is the frame from `frames/<source>/` that the split held out. The build has to
+    be the one the model trained on, which the training set hash in split.json and play.json
+    proves: a later build can have moved a training frame into the test folder.
+    """
+    coco = root / "coco"
+    listing = coco / "test" / "_annotations.coco.json"
+    if not (coco / "split.json").is_file() or not listing.is_file():
+        return [], ["no COCO build under the dataset root: run tools/play/coco.py first"]
+    split = json.loads((coco / "split.json").read_text(encoding="utf-8"))
+    caveats = []
+    if split.get("training_set_hash") != meta["training_set_hash"]:
+        caveats.append(
+            "coco/split.json has another training set hash than the model, so its test split "
+            "may hold frames the model trained on"
+        )
+    images = json.loads(listing.read_text(encoding="utf-8")).get("images", [])
+    names = sorted({image["file_name"] for image in images})
+    return [(name, coco / "test" / name) for name in names], caveats
+
+
+def scanned(folders: list[Path]) -> tuple[list[tuple[str, Path]], list[str]]:
+    """Every picture under the folders as (name, path) pairs, and why that cannot prove a pass."""
+    caveats = [SCAN]
+    folders = [folder for folder in folders if folder.is_dir()]
+    if not folders:
+        caveats.append("no frame folder to scan: pass --frames")
+    pictures = [
+        # The name is relative to its folder: an absolute path carries the user profile.
+        (path.relative_to(folder).as_posix(), path)
+        for folder in folders
+        for path in _pictures(folder)
+    ]
+    return pictures, caveats
+
+
+def truth_bar(text: str) -> int:
+    """An argparse type for a truth minimum: a whole number, at least 1."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{value} is below 1")
+    return value
+
+
+def recall_bar(text: str) -> float:
+    """An argparse type for a recall bar: a number in (0, 1]."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if not 0.0 < value <= 1.0:
+        raise argparse.ArgumentTypeError(f"{value} is outside (0, 1]")
+    return value
 
 
 def _read_frame(path: Path) -> np.ndarray | None:
@@ -180,66 +312,89 @@ def main(argv: list[str] | None = None, *, find=vision.find_with_score) -> int:
     ap.add_argument("--root", type=Path, default=None, help="dataset root")
     ap.add_argument("--models", type=Path, default=None, help="folder holding play.onnx")
     ap.add_argument(
+        "--min-truth",
+        type=truth_bar,
+        default=MIN_TRUTH,
+        help="template boxes a tap anchor needs in the scored frames before its recall counts "
+        f"(default {MIN_TRUTH})",
+    )
+    ap.add_argument(
+        "--min-recall",
+        type=recall_bar,
+        default=MIN_RECALL,
+        help=f"recall a measured tap anchor must reach (default {MIN_RECALL})",
+    )
+    ap.add_argument(
+        "--scan-folders",
+        action="store_true",
+        help="score every picture under the dataset's frames and the recordings instead of the "
+        "held-out test split; a scan is never a PASS",
+    )
+    ap.add_argument(
         "--frames",
         action="append",
         default=None,
         metavar="FOLDER",
-        help="score the pictures under this folder; repeat for more",
+        help="scan the pictures under this folder instead; repeat for more (implies "
+        "--scan-folders)",
     )
-    ap.add_argument("--cuda", action="store_true", help="ask for the CUDA provider")
+    ap.add_argument(
+        "--cuda", action="store_true", help="run on the CUDA provider, and stop if it is missing"
+    )
     args = ap.parse_args(argv)
 
     root = args.root if args.root is not None else dataset.default_root()
     models = args.models if args.models is not None else root / "models"
-    if args.frames is not None:
-        folders = [Path(name) for name in args.frames]
-    else:
-        folders = [root / "frames", settings.default_home() / "calibration" / "recordings"]
-    folders = [folder for folder in folders if folder.is_dir()]
-    if not folders:
-        print("no frame folder to score: pass --frames")
-        return 1
     if not (models / "play.onnx").is_file() or not (models / "play.json").is_file():
         print(f"no play.onnx and play.json under {models}: export a model first")
         return 1
 
     sess, meta = load_model(models, cuda=args.cuda)
+    scan = args.scan_folders or args.frames is not None
+    if args.frames is not None:
+        pictures, caveats = scanned([Path(name) for name in args.frames])
+    elif scan:
+        recordings = settings.default_home() / "calibration" / "recordings"
+        pictures, caveats = scanned([root / "frames", recordings])
+    else:
+        pictures, caveats = held_out(root, meta)
+    if meta["smoke"]:
+        caveats.append("the model was trained on a smoke set, so the report means nothing")
+
     rows: list[dict] = []
     failures: list[dict] = []
     unverified: list[dict] = []
     scored = skipped = 0
-    for folder in folders:
-        for path in _pictures(folder):
-            frame = _read_frame(path)
-            if frame is None:
-                skipped += 1
-                continue
-            height, width = frame.shape[:2]
-            if (width, height) != (dataset.FRAME_W, dataset.FRAME_H):
-                skipped += 1
-                continue
-            scored += 1
-            # The name is relative to its folder: an absolute path carries the user profile.
-            name = path.relative_to(folder).as_posix()
-            found = detect(sess, meta, frame)
-            verdicts = compare(found, template_truth(frame, find=find))
-            rows.append(verdicts)
-            failures.extend(
-                {"file": name, "class": cls}
-                for cls, verdict in sorted(verdicts.items())
-                if verdict in ("fp", "tp+extra") and cls in classes.TAP_ANCHORS
-            )
-            unverified.extend(
-                {"file": name, "class": box["class"]}
-                for box in found
-                if box["class"] in UNVERIFIABLE
-            )
+    for name, path in pictures:
+        frame = _read_frame(path) if path.is_file() else None
+        if frame is None:
+            skipped += 1
+            continue
+        height, width = frame.shape[:2]
+        if (width, height) != (dataset.FRAME_W, dataset.FRAME_H):
+            skipped += 1
+            continue
+        scored += 1
+        found = detect(sess, meta, frame)
+        verdicts = compare(found, template_truth(frame, find=find))
+        rows.append(verdicts)
+        failures.extend(
+            {"file": name, "class": cls}
+            for cls, verdict in sorted(verdicts.items())
+            if verdict in ("fp", "tp+extra") and cls in classes.TAP_ANCHORS
+        )
+        unverified.extend(
+            {"file": name, "class": box["class"]} for box in found if box["class"] in UNVERIFIABLE
+        )
 
-    summary = report(rows)
+    summary = report(rows, min_truth=args.min_truth, min_recall=args.min_recall, caveats=caveats)
     summary |= {
         "generated": datetime.now(UTC).isoformat(timespec="seconds"),
         "training_set_hash": meta["training_set_hash"],
         "smoke": meta["smoke"],
+        "held_out": not scan,
+        "min_truth": args.min_truth,
+        "min_recall": args.min_recall,
         "frames": {"scored": scored, "skipped": skipped},
         "tap_anchor_failures": failures,
         "unverified_tap_anchor_detections": unverified,
@@ -247,35 +402,44 @@ def main(argv: list[str] | None = None, *, find=vision.find_with_score) -> int:
     models.mkdir(parents=True, exist_ok=True)
     (models / "score.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
 
-    print(f"{scored} frames scored, {skipped} skipped (unreadable or not 1600 x 900)")
-    if not scored:
-        # An empty report would otherwise pass every bar it has, having tested nothing.
-        print("no 1600 x 900 frames were scored; nothing is proven")
-        print(f"wrote {models / 'score.json'}")
-        return 1
-    print(f"  {'class':<18} {'tp':>5} {'fp':>5} {'fn':>5} {'tn':>5} {'prec':>6} {'rec':>6}")
-    for cls, count in summary["classes"].items():
-        anchor = " tap anchor" if cls in classes.TAP_ANCHORS else ""
-        print(
-            f"  {cls:<18} {count['tp']:>5} {count['fp']:>5} {count['fn']:>5} {count['tn']:>5} "
-            f"{count['precision']:>6.3f} {count['recall']:>6.3f}{anchor}"
-        )
+    where = "frames scanned" if scan else "held-out test frames scored"
+    print(f"{scored} {where}, {skipped} skipped (unreadable or not 1600 x 900)")
+    if scored:
+        head = f"{'class':<18} {'truth':>5} {'tp':>5} {'fp':>5} {'fn':>5} {'tn':>5}"
+        print(f"  {head} {'prec':>6} {'rec':>6}")
+        for cls, count in summary["classes"].items():
+            anchor = " tap anchor" if cls in classes.TAP_ANCHORS else ""
+            print(
+                f"  {cls:<18} {count['tp'] + count['fn']:>5} {count['tp']:>5} {count['fp']:>5} "
+                f"{count['fn']:>5} {count['tn']:>5} {count['precision']:>6.3f} "
+                f"{count['recall']:>6.3f}{anchor}"
+            )
     for bad in failures:
         print(f"  never-tap failure: {bad['class']} on {bad['file']}, the templates see none there")
+    print(
+        f"no label source for {', '.join(summary['no_label_source'])}: these tap anchors have no "
+        "template, so they are not measured and do not change the verdict"
+    )
     if unverified:
         print(
-            f"{len(unverified)} detections of {', '.join(sorted(UNVERIFIABLE))}: these tap anchors "
-            "have no template, so nothing here can call them right or wrong. Check them by hand."
+            f"{len(unverified)} detections of them, which nothing here can call right or wrong. "
+            "Check them by hand."
         )
         for box in unverified:
             print(f"  unverified: {box['class']} on {box['file']}")
-    if meta["smoke"]:
-        print("WARNING: this model was trained on a smoke set. The report means nothing.")
     print(f"wrote {models / 'score.json'}")
-    print(
-        "PASS: no tap anchor detected where the templates see none" if summary["pass"] else "FAIL"
-    )
-    return 0 if summary["pass"] else 1
+    if summary["verdict"] == PASS:
+        print(
+            "PASS: every tap anchor with a template was found often enough, and none was "
+            "detected where the templates see none"
+        )
+    else:
+        print(summary["verdict"])
+    for reason in summary["fail_reasons"]:
+        print(f"  fail: {reason}")
+    for reason in summary["inconclusive_reasons"]:
+        print(f"  inconclusive: {reason}")
+    return EXIT_CODES[summary["verdict"]]
 
 
 if __name__ == "__main__":

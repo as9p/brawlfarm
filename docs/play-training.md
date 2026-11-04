@@ -346,19 +346,42 @@ are written to `play.json` next to `play.onnx`.
 uv run python tools/play/score.py
 ```
 
-`--root` picks the dataset root, `--models` the folder holding `play.onnx` (default
-`models/`), `--frames` adds a folder of pictures to score besides the dataset root's own frames
-(repeat the flag for more), and `--cuda` asks for the CUDA execution provider.
+`score.py` runs the exported model over the **held-out test split**, the frames `coco.py` put
+in `coco/test/` and training never saw, and compares what it finds with the farm's own
+templates on every 1600 x 900 frame there. It trusts that split only when `coco/split.json`
+carries the same training set hash as `play.json`, since a build made after training can have
+moved training frames into the test folder. The report is written to `score.json` next to
+`play.onnx` and ends in one of three verdicts, which is also the exit code:
 
-`score.py` compares the exported model against the farm's own templates on every 1600 x 900
-frame it can find. The bar is not an average score: it is that the model never produces a
-**false positive** (a detection that should not be there) on a tap anchor, a class the farm
-would act on, because a tap on the wrong pixel can spend gems or leave a match queue. A single
-extra detection next to a correct one still fails the whole report. Missing a control the
-template found is only logged, not failed, because a miss just means a slower loop rather than
-a wrong tap. A run that scores no frames at all also fails, since a silent zero is not a pass.
-Three tap anchors have no template behind them (`skull_star`, `team_up_panel`, `event_tab`);
-those are listed separately as unverified and do not count toward the bar either way.
+- **PASS** (exit code 0): every tap anchor with a template behind it was measured and found
+  often enough, and none was detected where the templates see none.
+- **FAIL** (exit code 1): the model produced a **false positive** (a detection that should not
+  be there) on a tap anchor, a class the farm would act on, because a tap on the wrong pixel
+  can spend gems or leave a match queue. A single extra detection next to a correct one counts.
+  A tap anchor with at least `--min-truth` template boxes also fails when its **recall** (the
+  fraction of those boxes the model found too) is under `--min-recall`.
+- **INCONCLUSIVE** (exit code 2): nothing in the run proves the model safe. That is the verdict
+  when a tap anchor with a template has fewer than `--min-truth` template boxes in the scored
+  frames, when no frame was scored, when there is no COCO build, when the model was trained on
+  a smoke set, and for every folder scan.
+
+A FAIL wins over an INCONCLUSIVE, because a false positive is real wherever it was seen. For
+each tap anchor, `score.json` lists its truth (the template boxes in the scored frames), true
+positives, misses, false positives and recall, plus the reasons the verdict is not PASS, and
+the same reasons are printed under the verdict. Three tap anchors have no template behind them
+(`skull_star`, `team_up_panel`, `event_tab`): they are listed as having no label source, any
+detection of one is listed as unverified for you to check by hand, and they never change the
+verdict.
+
+`--root` picks the dataset root and `--models` the folder holding `play.onnx` (default
+`models/`). `--min-truth` is how many template boxes a tap anchor needs before its recall
+counts (default 30), and `--min-recall` is the recall it must then reach (default 0.5).
+`--cuda` runs the model on the CUDA execution provider; if onnxruntime cannot give it, the run
+stops with an error instead of quietly using the CPU, and the fix is the `play-gpu` extra
+described in [install.md](install.md). `--scan-folders` scores every picture under the dataset
+root's own frames and the calibration recordings instead of the test split, and `--frames`
+scans a folder you name instead (repeat the flag for more). Those folders hold training frames
+too, so a scan is only for looking at footage and always ends INCONCLUSIVE.
 
 ## How the first model ships
 
