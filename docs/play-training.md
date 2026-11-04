@@ -341,6 +341,17 @@ more than the 8 used for a smoke test), `--batch` the number of images per train
 lets a small GPU behave like a bigger one. On an RTX 4080 SUPER, 8 epochs on a tiny set took
 about 50 seconds; a real run takes much longer. Output goes to `runs/<YYYYmmdd-HHMMSS>/`.
 
+Tap anchors (the buttons, cards and panels the controller taps) are rare in the frames, so
+training **oversamples** them: every training image that holds at least one tap-anchor box goes
+into the training data four times instead of once. `--anchor-repeat` sets how many times, as a
+whole number of 1 or more, and `--anchor-repeat 1` turns it off. The repeats are written as
+annotation files in `runs/<YYYYmmdd-HHMMSS>/feed/` that point at the frames in `coco/`, so no
+frame is copied, and the run trains on that folder instead of `coco/`. Only the training split
+is oversampled: the validation and test images still go in once each, so the thresholds export
+picks and the score are measured on images counted once. Training prints how many images it
+repeated. When no training image holds a tap anchor, or the flag is 1, it trains on `coco/`
+directly.
+
 ## Step 8: export
 
 ```
@@ -366,6 +377,16 @@ could spend gems) always need 0.98, and no flag changes that. Every other class,
 no validation images, or one that never reaches its target, gets 0.95, the most cautious
 threshold available. Thresholds, the target each class was held to and the run they came from
 are written to `play.json` next to `play.onnx`.
+
+Next to each threshold, `play.json` records how many validation boxes of that class there were
+(`truth`) and whether the threshold is **certified** (`certified`). A threshold is certified
+only when there were at least 30 validation boxes of its class and it really reached its
+precision target. With fewer boxes, one box moves the precision too far to trust it, and the
+0.95 fallback is never certified, however many boxes there were. Export prints every class that
+is not certified, with the reason. An uncertified threshold is still written and the detector
+still loads it: it means the model is not proven on that class yet, and the fix is more frames
+that show it. 30 is the same number `coco.py` warns about when a tap anchor has too few boxes in
+the validation or test split.
 
 ## Step 9: score
 
