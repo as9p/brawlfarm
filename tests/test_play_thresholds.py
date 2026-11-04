@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tools.play import thresholds
+from tools.play import export, thresholds
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "tools" / "play"
 
@@ -83,6 +83,58 @@ def test_pick_returns_the_ceiling_without_detections():
 
 def test_pick_returns_the_ceiling_when_precision_is_never_reached():
     assert thresholds.pick([0.9, 0.8], [False, False]) == thresholds.CEILING
+
+
+# precision 0.90 from 0.30 up, and 0.98 only once both false positives are cleared at 0.61
+_NINETY_SCORES = [0.9] * 9 + [0.35] * 9 + [0.6, 0.4]
+_NINETY_HITS = [True] * 18 + [False, False]
+
+
+def test_target_for_keeps_tap_anchors_at_the_strict_precision():
+    assert thresholds.target_for("play_button") == thresholds.MIN_PRECISION == 0.98
+    assert thresholds.target_for("skull_star", other=0.5) == thresholds.MIN_PRECISION
+
+
+def test_target_for_gives_other_classes_the_looser_precision():
+    assert thresholds.target_for("self") == thresholds.MIN_PRECISION_OTHER == 0.90
+    assert thresholds.target_for("enemy", other=0.8) == 0.8
+
+
+def test_pick_thresholds_splits_tap_anchors_from_other_classes():
+    names = ["self", "play_button"]
+    scores = {0: _NINETY_SCORES, 1: _NINETY_SCORES}
+    hits = {0: _NINETY_HITS, 1: _NINETY_HITS}
+    picked, validation = export.pick_thresholds(
+        names, scores, hits, {0: 18, 1: 18}, thresholds.MIN_PRECISION_OTHER
+    )
+    assert picked["self"] == thresholds.FLOOR
+    assert picked["play_button"] == pytest.approx(0.61)
+    assert validation["self"]["min_precision"] == 0.90
+    assert validation["play_button"]["min_precision"] == 0.98
+    assert validation["self"]["precision_at_threshold"] == 0.9
+
+
+def test_export_flag_sets_the_other_precision_and_is_passed_through():
+    assert export.parser().parse_args([]).min_precision_other == thresholds.MIN_PRECISION_OTHER
+    args = export.parser().parse_args(["--min-precision-other", "1"])
+    assert args.min_precision_other == 1.0
+    picked, validation = export.pick_thresholds(
+        ["self", "play_button"],
+        {0: _NINETY_SCORES, 1: _NINETY_SCORES},
+        {0: _NINETY_HITS, 1: _NINETY_HITS},
+        {0: 18, 1: 18},
+        args.min_precision_other,
+    )
+    assert picked["self"] == pytest.approx(0.61)
+    assert validation["self"]["min_precision"] == 1.0
+    assert validation["play_button"]["min_precision"] == thresholds.MIN_PRECISION
+
+
+@pytest.mark.parametrize("value", ["0", "-0.5", "1.01", "abc"])
+def test_export_flag_rejects_a_precision_outside_zero_to_one(value):
+    with pytest.raises(SystemExit) as raised:
+        export.parser().parse_args(["--min-precision-other", value])
+    assert raised.value.code == 2
 
 
 def test_decode_reads_the_expected_box_and_ignores_the_last_column():
