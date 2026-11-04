@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from brawlfarm.play import detect
-from tools.play import classes, thresholds
+from tools.play import classes, export, thresholds
 
 
 class FakeSession:
@@ -234,6 +234,20 @@ def test_load_carries_the_model_facts(tmp_path):
     assert loaded.size == 384
     assert loaded.provider == "CUDAExecutionProvider"
     assert loaded.fake.path == folder / detect.MODEL_FILE
+
+
+def test_load_takes_the_certification_export_writes(tmp_path):
+    """export.py marks each class's threshold certified or not. The detector runs in shadow mode
+    only and reads none of it, so the extra keys load and change nothing."""
+    picked, validation = export.pick_thresholds(
+        ["self", "enemy"], {0: [0.9] * 40, 1: []}, {0: [True] * 40, 1: []}, {0: 40, 1: 0}, 0.9
+    )
+    assert validation["self"]["certified"] is True
+    assert validation["enemy"]["certified"] is False
+
+    loaded = load(write_model(tmp_path, meta_doc(thresholds=picked, validation=validation)))
+    assert loaded.classes == ("self", "enemy")
+    assert picked == {"self": 0.30, "enemy": 0.95}
 
 
 def test_load_defaults_smoke_and_hash(tmp_path):

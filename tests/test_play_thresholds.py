@@ -137,6 +137,70 @@ def test_export_flag_rejects_a_precision_outside_zero_to_one(value):
     assert raised.value.code == 2
 
 
+def test_min_truth_is_thirty_and_coco_warns_against_the_same_number():
+    from tools.play import coco
+
+    assert thresholds.MIN_TRUTH == 30
+    assert coco.TRUTH_MIN == thresholds.MIN_TRUTH
+
+
+def test_pick_thresholds_certifies_a_class_only_with_enough_validation_truth(capsys):
+    picked, validation = export.pick_thresholds(
+        ["self", "play_button"],
+        {0: _NINETY_SCORES, 1: _NINETY_SCORES},
+        {0: _NINETY_HITS, 1: _NINETY_HITS},
+        {0: thresholds.MIN_TRUTH, 1: thresholds.MIN_TRUTH - 1},
+        thresholds.MIN_PRECISION_OTHER,
+    )
+    assert validation["self"]["truth"] == 30
+    assert validation["self"]["certified"] is True
+    assert validation["play_button"]["truth"] == 29
+    assert validation["play_button"]["certified"] is False
+    # an uncertified threshold is still written: certification is a label, not a veto
+    assert picked["play_button"] == pytest.approx(0.61)
+    out = capsys.readouterr().out
+    assert "WARNING: play_button is not certified: 29 validation truth boxes, fewer than 30" in out
+    assert "WARNING: self" not in out
+
+
+def test_pick_thresholds_marks_the_fallback_uncertified_however_much_truth_there_is(capsys):
+    # play_button has no detection at all; self has detections that never reach its target
+    picked, validation = export.pick_thresholds(
+        ["play_button", "self"],
+        {0: [], 1: [0.5, 0.6]},
+        {0: [], 1: [False, False]},
+        {0: 500, 1: 500},
+        thresholds.MIN_PRECISION_OTHER,
+    )
+    assert picked == {"play_button": thresholds.CEILING, "self": thresholds.CEILING}
+    assert validation["play_button"]["certified"] is False
+    assert validation["self"]["certified"] is False
+    out = capsys.readouterr().out
+    assert "WARNING: play_button is not certified: 0.95 is the fallback" in out
+    assert "WARNING: self is not certified: 0.95 is the fallback" in out
+
+
+def test_pick_thresholds_names_both_reasons_when_a_class_has_both(capsys):
+    export.pick_thresholds(["close_x"], {0: []}, {0: []}, {0: 0}, thresholds.MIN_PRECISION_OTHER)
+    out = capsys.readouterr().out
+    assert (
+        "WARNING: close_x is not certified: 0 validation truth boxes, fewer than 30; "
+        "0.95 is the fallback" in out
+    )
+
+
+def test_pick_thresholds_warns_about_nothing_when_every_class_is_certified(capsys):
+    _picked, validation = export.pick_thresholds(
+        ["self", "play_button"],
+        {0: _NINETY_SCORES, 1: _NINETY_SCORES},
+        {0: _NINETY_HITS, 1: _NINETY_HITS},
+        {0: 30, 1: 31},
+        thresholds.MIN_PRECISION_OTHER,
+    )
+    assert all(row["certified"] for row in validation.values())
+    assert "WARNING" not in capsys.readouterr().out
+
+
 def test_decode_reads_the_expected_box_and_ignores_the_last_column():
     dets = np.zeros((1, 2, 4), dtype=np.float32)
     dets[0, 0] = (0.5, 0.5, 0.2, 0.4)

@@ -26,7 +26,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from tools.play import classes, dataset
+from tools.play import classes, dataset, thresholds
 
 SPLITS = (("train", 0.8), ("valid", 0.1), ("test", 0.1))
 # Below this many split keys a real split would leave a side empty, so the kit builds a smoke
@@ -49,8 +49,8 @@ YOUTUBE_PREFIX = "yt-"
 WINDOW_MARK = "@"
 STAMP_RE = re.compile(r"(?<!\d)(\d{8})-(\d{6})(?!\d)")
 # A tap anchor needs this many truth boxes in valid and in test before a threshold or a score
-# drawn from that split means anything.
-TRUTH_MIN = 30
+# drawn from that split means anything: the same number export.py certifies a threshold by.
+TRUTH_MIN = thresholds.MIN_TRUTH
 # The templates are the only label source for tap anchors. An anchor no template maps to has no
 # truth anywhere, so it is reported as having no label source rather than warned about.
 LABELLED_ANCHORS = classes.TAP_ANCHORS & frozenset(classes.TEMPLATE_CLASS.values())

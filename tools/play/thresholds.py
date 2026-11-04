@@ -24,6 +24,9 @@ MIN_PRECISION = 0.98
 # a class the controller only watches: a false positive costs a wrong guess, not a tap
 MIN_PRECISION_OTHER = 0.90
 FLOOR, CEILING = 0.30, 0.95
+# Below this many validation truth boxes a class's precision swings on a box or two, so export.py
+# does not certify its threshold, and coco.py warns about a valid or test split that thin.
+MIN_TRUTH = 30
 # the ImageNet statistics RF-DETR normalises with, in RGB order
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
