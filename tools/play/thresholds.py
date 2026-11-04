@@ -2,12 +2,15 @@
 
 A detector that ships to the farm loop is allowed to miss things and is not allowed to invent
 them: a false positive on a tap anchor is a tap on the wrong pixel. So a threshold is picked per
-class as the lowest one that still buys MIN_PRECISION on the validation set, never a single
-number for the whole model, and it never drops below FLOOR however clean a class looks.
+class as the lowest one that still buys its precision target on the validation set, never a
+single number for the whole model, and it never drops below FLOOR however clean a class looks.
+A tap anchor (classes.TAP_ANCHORS) is held to MIN_PRECISION; every other class is only ever
+watched, never tapped, and is held to the looser MIN_PRECISION_OTHER.
 
 This module is imported by train.py and export.py, which run in their own isolated environment
 with rfdetr and torch in it and no brawlfarm. It therefore imports numpy and the standard
-library only, and pulls cv2 in inside preprocess where a resize is unavoidable.
+library only, pulls cv2 in inside preprocess where a resize is unavoidable, and pulls the
+standard-library-only tools.play.classes in inside target_for.
 """
 
 from __future__ import annotations
@@ -16,7 +19,10 @@ from collections.abc import Sequence
 
 import numpy as np
 
+# a tap anchor's false positive is a tap on the wrong pixel, which can spend gems
 MIN_PRECISION = 0.98
+# a class the controller only watches: a false positive costs a wrong guess, not a tap
+MIN_PRECISION_OTHER = 0.90
 FLOOR, CEILING = 0.30, 0.95
 # the ImageNet statistics RF-DETR normalises with, in RGB order
 MEAN = (0.485, 0.456, 0.406)
@@ -59,6 +65,13 @@ def match_detections(dets: list[dict], truth: list[dict], iou_min: float = 0.5) 
             taken[best] = True
         hits.append(best >= 0)
     return hits
+
+
+def target_for(name: str, *, other: float = MIN_PRECISION_OTHER) -> float:
+    """The precision a class has to reach: MIN_PRECISION for a tap anchor, `other` otherwise."""
+    from tools.play import classes  # inside the body: the import test allows numpy at top level
+
+    return MIN_PRECISION if name in classes.TAP_ANCHORS else other
 
 
 def pick(

@@ -12,17 +12,20 @@
 """Export a trained run to ONNX and score a confidence threshold for every class.
 
 Runs in the same isolated environment as train.py, and like it takes nothing from the project
-but tools/play/thresholds.py:
+but tools/play/thresholds.py and tools/play/classes.py:
 
     uv run tools/play/export.py
     uv run tools/play/export.py --root D:/play-data --run 20260920-231500
+    uv run tools/play/export.py --min-precision-other 0.85
 
 The export is checked before it is believed. The library's own predict and a hand-rolled
 onnxruntime pass over the same validation images must agree on nearly every box, which is what
 catches a shifted column in the logits: an off-by-one there turns every class into its
 neighbour, and every check downstream still looks fine. Only then does each class get the
-lowest threshold that still buys thresholds.MIN_PRECISION on the validation set, and only then
-are models/play.onnx and models/play.json written.
+lowest threshold that still buys its precision target on the validation set, and only then
+are models/play.onnx and models/play.json written. A tap anchor's target is always
+thresholds.MIN_PRECISION; every other class gets --min-precision-other, which defaults to
+thresholds.MIN_PRECISION_OTHER.
 """
 
 from __future__ import annotations
@@ -127,14 +130,67 @@ def agrees(box: dict, found: list[dict]) -> bool:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+def precision(text: str) -> float:
+    """An argparse type for a precision target: a number in (0, 1]."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if not 0.0 < value <= 1.0:
+        raise argparse.ArgumentTypeError(f"{value} is outside (0, 1]")
+    return value
+
+
+def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--root", type=Path, default=None, help="dataset root")
     ap.add_argument("--run", default=None, help="run folder, or its name under runs/")
-    args = ap.parse_args(argv)
+    ap.add_argument(
+        "--min-precision-other",
+        type=precision,
+        default=thresholds.MIN_PRECISION_OTHER,
+        help="precision target for every class that is not a tap anchor "
+        f"(default {thresholds.MIN_PRECISION_OTHER}); tap anchors always use "
+        f"{thresholds.MIN_PRECISION}",
+    )
+    return ap
+
+
+def pick_thresholds(
+    names: list[str],
+    scores: dict[int, list[float]],
+    hits: dict[int, list[bool]],
+    truth_counts: dict[int, int],
+    min_precision_other: float,
+) -> tuple[dict[str, float], dict[str, dict]]:
+    """Every class's threshold, and the validation numbers play.json records next to it."""
+    picked: dict[str, float] = {}
+    validation: dict[str, dict] = {}
+    for index, name in enumerate(names):
+        target = thresholds.target_for(name, other=min_precision_other)
+        threshold = thresholds.pick(scores[index], hits[index], min_precision=target)
+        above = [
+            hit for score, hit in zip(scores[index], hits[index], strict=True) if score >= threshold
+        ]
+        picked[name] = threshold
+        validation[name] = {
+            "truth": truth_counts[index],
+            "detections": len(above),
+            "precision_at_threshold": round(sum(above) / len(above), 4) if above else 0.0,
+            "min_precision": target,
+        }
+        print(
+            f"  {name} threshold {threshold:.2f} target {target:.2f} "
+            f"truth {truth_counts[index]} detections {len(above)}"
+        )
+    return picked, validation
+
+
+def main(argv: list[str] | None = None) -> int:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    args = parser().parse_args(argv)
 
     root = args.root if args.root is not None else default_root()
     if args.run is None:
@@ -225,23 +281,9 @@ def main(argv: list[str] | None = None) -> int:
         print("The column mapping in thresholds.decode is wrong for this rfdetr build.")
         return 1
 
-    picked: dict[str, float] = {}
-    validation: dict[str, dict] = {}
-    for index, name in enumerate(names):
-        threshold = thresholds.pick(scores[index], hits[index])
-        above = [
-            hit for score, hit in zip(scores[index], hits[index], strict=True) if score >= threshold
-        ]
-        picked[name] = threshold
-        validation[name] = {
-            "truth": truth_counts[index],
-            "detections": len(above),
-            "precision_at_threshold": round(sum(above) / len(above), 4) if above else 0.0,
-        }
-        print(
-            f"  {name} threshold {threshold:.2f} truth {truth_counts[index]} "
-            f"detections {len(above)}"
-        )
+    picked, validation = pick_thresholds(
+        names, scores, hits, truth_counts, args.min_precision_other
+    )
 
     models = root / "models"
     models.mkdir(parents=True, exist_ok=True)

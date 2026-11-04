@@ -331,9 +331,14 @@ seconds and produced a `play.onnx` file of about 119 MB.
 Export also picks a **threshold** for every class: the score above which a detection counts.
 For each class, it is the lowest threshold between 0.30 and 0.95 that still keeps
 **precision** (the fraction of the model's detections of that class that are actually correct)
-at or above 0.98 on the validation images. A class with no validation images gets 0.95, the
-most cautious threshold available. Thresholds and the run they came from are written to
-`play.json` next to `play.onnx`.
+at or above a target on the validation images. The target depends on what the class is for.
+The tap anchors (the buttons, cards and panels the controller taps, where one false positive
+could spend gems) always need 0.98, and no flag changes that. Every other class, such as
+`self`, `teammate` and `enemy`, is only watched and never tapped, so it needs 0.90; pass
+`--min-precision-other` with a number above 0 and at most 1 to change that target. A class with
+no validation images, or one that never reaches its target, gets 0.95, the most cautious
+threshold available. Thresholds, the target each class was held to and the run they came from
+are written to `play.json` next to `play.onnx`.
 
 ## Step 9: score
 
