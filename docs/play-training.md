@@ -328,7 +328,10 @@ class, zeros included.
 
 `train.py` is a self-contained script: `uv run tools/play/train.py` builds its own environment
 on first run, including torch from the CUDA 12.8 index, about 3 GB. It never touches the
-project's own `pyproject.toml` or lock file.
+project's own `pyproject.toml` or lock file. To train on the GPU you need an NVIDIA GPU with a
+display driver new enough for CUDA 12.8 (the CUDA runtime comes inside that torch build), and the
+script must be started with `uv run` as below, since a torch from any other environment may be a
+CPU-only build.
 
 ```
 uv run tools/play/train.py

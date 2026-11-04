@@ -48,8 +48,9 @@ from tools.play import classes, dataset, prelabel, thresholds
 SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
 PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
 EXIT_CODES = {PASS: 0, FAIL: 1, INCONCLUSIVE: 2}
-# Below this many template boxes a recall swings on a frame or two, so it proves nothing.
-MIN_TRUTH = 30
+# Below this many template boxes a recall swings on a frame or two, so it proves nothing: the
+# same number export.py certifies a threshold by.
+MIN_TRUTH = thresholds.MIN_TRUTH
 MIN_RECALL = 0.5
 # tap anchors a template labels: the only ones whose misses this report can count
 LABELLED: frozenset[str] = classes.TAP_ANCHORS & set(classes.TEMPLATE_CLASS.values())

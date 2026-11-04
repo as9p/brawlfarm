@@ -89,12 +89,19 @@ def fake_rfdetr(monkeypatch):
     return calls
 
 
-def _fake_torch(monkeypatch, cuda: bool, name: str = "NVIDIA GeForce RTX 4080 SUPER") -> None:
-    """torch as a stand-in that sees a CUDA GPU or does not, with no GPU and no real torch."""
+def _fake_torch(
+    monkeypatch, cuda: bool, name: str = "NVIDIA GeForce RTX 4080 SUPER", mps: bool | None = None
+) -> None:
+    """torch as a stand-in that sees a CUDA GPU or does not, with no GPU and no real torch.
+
+    mps None leaves out torch.backends entirely, like an older torch with no backends.mps.
+    """
     module = types.ModuleType("torch")
     module.cuda = types.SimpleNamespace(
         is_available=lambda: cuda, get_device_name=lambda device=None: name
     )
+    if mps is not None:
+        module.backends = types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: mps))
     monkeypatch.setitem(sys.modules, "torch", module)
 
 
@@ -239,8 +246,21 @@ def test_describe_device_warns_loudly_on_the_cpu(monkeypatch, capsys):
     assert len(warnings) >= 3
     text = " ".join(warnings)
     assert "very slow" in text
-    assert "play-gpu" in text
-    assert "docs/install.md" in text
+    assert "CUDA build" in text
+    assert "uv run tools/play/train.py" in text
+    assert "NVIDIA display driver" in text
+    assert "docs/play-training.md" in text
+    # the play-gpu extra brings onnxruntime-gpu, not torch, so it is not the fix here
+    assert "play-gpu" not in text
+
+
+def test_describe_device_names_mps_and_does_not_warn(monkeypatch, capsys):
+    _fake_torch(monkeypatch, cuda=False, mps=True)
+    train.describe_device()
+    out = capsys.readouterr().out
+    assert "training device mps" in out
+    assert "training device cpu" not in out
+    assert "WARNING" not in out
 
 
 def test_describe_device_does_not_crash_without_torch(monkeypatch, capsys):

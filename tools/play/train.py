@@ -75,7 +75,8 @@ def describe(summary: dict) -> None:
 def describe_device() -> None:
     """Print the device rfdetr will train on, and shout when it is the CPU: a CPU run takes hours.
 
-    This only reports. rfdetr still picks the device itself, from the same torch check.
+    This only reports. rfdetr still picks the device itself, and like this check it prefers CUDA,
+    then Apple's MPS, then the CPU.
     """
     try:
         import torch  # here, like rfdetr, so the tests run without torch
@@ -85,12 +86,20 @@ def describe_device() -> None:
     if torch.cuda.is_available():
         print(f"training device cuda ({torch.cuda.get_device_name()})")
         return
+    # an older torch has no backends.mps at all
+    mps = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps is not None and mps.is_available():
+        print("training device mps")
+        return
     print("training device cpu")
     print("")
     print("WARNING: torch sees no CUDA GPU, so this run trains on the CPU.")
     print("WARNING: CPU training is very slow: a 60-epoch run can take many hours.")
-    print("WARNING: To train on the GPU, set up the NVIDIA GPU and driver that the play-gpu")
-    print("WARNING: extra needs, as docs/install.md describes, then run this again.")
+    print("WARNING: To train on the GPU, torch must be a CUDA build and the NVIDIA display driver")
+    print("WARNING: must be new enough for CUDA 12.8. Start it as `uv run tools/play/train.py`:")
+    print("WARNING: its inline metadata gives it its own environment with torch from the CUDA")
+    print("WARNING: 12.8 index. A torch from any other environment may be a CPU-only build.")
+    print("WARNING: See docs/play-training.md, Step 7: train, then run this again.")
     print("")
 
 
