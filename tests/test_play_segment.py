@@ -52,4 +52,43 @@ def test_run_writes_one_line_per_prompt(tmp_path):
         {"class": "enemy", "x": 755, "y": 310, "w": 90, "h": 95, "score": 0.9, "fallback": False}
     ]
     assert rows[1]["boxes"] == []
-    assert summary == {"frames": 2, "boxes": 1, "fallbacks": 0, "missing": 1}
+    assert summary == {"frames": 2, "boxes": 1, "fallbacks": 0, "missing": 1, "skipped": 0}
+
+
+def test_run_with_resume_skips_done_frames_and_drops_a_cut_off_line(tmp_path):
+    black = np.zeros((dataset.FRAME_H, dataset.FRAME_W, 3), np.uint8)
+    done = dataset.save_frame(tmp_path, "alpha", 1, black)
+    todo = dataset.save_frame(tmp_path, "alpha", 2, black)
+    prompts = tmp_path / "prompts.jsonl"
+    lines = [{"file": done, "bars": [_bar().to_json()]}, {"file": todo, "bars": [_bar().to_json()]}]
+    prompts.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    out = tmp_path / "boxes.jsonl"
+    kept = json.dumps({"file": done, "boxes": []})
+    out.write_text(kept + "\n" + '{"file": "frames/alpha/al', encoding="utf-8")
+    asked = []
+
+    def counting(frame, bars):
+        asked.append(len(bars))
+        return _body_segmenter(frame, bars)
+
+    summary = segment.run(tmp_path, prompts, out, counting, resume=True)
+
+    rows = out.read_text(encoding="utf-8").splitlines()
+    assert rows[0] == kept
+    assert [json.loads(r)["file"] for r in rows] == [done, todo]
+    assert asked == [1]
+    assert summary == {"frames": 1, "boxes": 1, "fallbacks": 0, "missing": 0, "skipped": 1}
+
+
+def test_run_without_resume_writes_fresh(tmp_path):
+    black = np.zeros((dataset.FRAME_H, dataset.FRAME_W, 3), np.uint8)
+    rel = dataset.save_frame(tmp_path, "alpha", 1, black)
+    prompts = tmp_path / "prompts.jsonl"
+    prompts.write_text(json.dumps({"file": rel, "bars": []}) + "\n", encoding="utf-8")
+    out = tmp_path / "boxes.jsonl"
+    out.write_text(json.dumps({"file": rel, "boxes": [{"stale": True}]}) + "\n", encoding="utf-8")
+
+    summary = segment.run(tmp_path, prompts, out, _body_segmenter)
+
+    assert out.read_text(encoding="utf-8") == json.dumps({"file": rel, "boxes": []}) + "\n"
+    assert summary["skipped"] == 0

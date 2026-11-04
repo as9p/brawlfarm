@@ -122,7 +122,7 @@ def test_main_hands_bars_to_the_sam_stage(tmp_path, monkeypatch):
     monkeypatch.setattr(brawlers, "classify", lambda *a, **k: [ENEMY])
     seen = {}
 
-    def fake_segment(root, prompts, out, model):
+    def fake_segment(root, prompts, out, model, resume=False):
         seen["prompts"] = [json.loads(x) for x in prompts.read_text(encoding="utf-8").splitlines()]
         seen["model"] = model
         box = {
@@ -165,7 +165,7 @@ def test_a_failed_sam_pass_writes_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(autolabel, "ocr_engine", lambda: _FakeOcr([]))
     monkeypatch.setattr(brawlers, "classify", lambda *a, **k: [ENEMY])
 
-    def failing_segment(root, prompts, out, model):
+    def failing_segment(root, prompts, out, model, resume=False):
         raise subprocess.CalledProcessError(1, ["uv", "run", "segment.py"])
 
     monkeypatch.setattr(autolabel, "run_segment", failing_segment)
@@ -201,3 +201,146 @@ def test_a_frame_that_fails_is_reported_and_skipped(tmp_path, monkeypatch, capsy
     out = capsys.readouterr().out
     assert f"{rels[0]}: RuntimeError: classify broke" in out
     assert "1 failed" in out
+
+
+def _pass1(root):
+    path = root / "autolabel" / autolabel.PASS1_NAME
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _count_labels(monkeypatch):
+    """Wrap label_frame so a test can see which frames went through the first pass."""
+    seen = []
+    real = autolabel.label_frame
+
+    def counting(bgr, row, zone, ocr):
+        seen.append(row["file"])
+        return real(bgr, row, zone, ocr)
+
+    monkeypatch.setattr(autolabel, "label_frame", counting)
+    return seen
+
+
+def _bars_everywhere(monkeypatch):
+    monkeypatch.setattr(prelabel, "boxes_for", lambda frame, **kw: [])
+    monkeypatch.setattr(autolabel, "ocr_engine", lambda: _FakeOcr([]))
+    monkeypatch.setattr(brawlers, "classify", lambda *a, **k: [ENEMY])
+
+
+def test_first_pass_writes_a_checkpoint_line_per_labelled_frame(tmp_path, monkeypatch):
+    rels = _dataset(tmp_path, n=3)
+    monkeypatch.setattr(prelabel, "boxes_for", lambda frame, **kw: [])
+    monkeypatch.setattr(autolabel, "ocr_engine", lambda: _FakeOcr([]))
+    outcomes = iter([[ENEMY], RuntimeError("classify broke"), []])
+
+    def flaky_classify(*a, **k):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(brawlers, "classify", flaky_classify)
+    assert autolabel.main(["--root", str(tmp_path), "--no-sam"]) == 0
+    lines = _pass1(tmp_path)
+    assert [line["file"] for line in lines] == [rels[0], rels[2]]
+    assert lines[0] == {
+        "version": autolabel.MODEL_VERSION,
+        "file": rels[0],
+        "template": [],
+        "terrain": lines[0]["terrain"],
+        "bars": [ENEMY.to_json()],
+        "in_match": True,
+    }
+    assert lines[1]["bars"] == []
+
+
+def _fresh_then(tmp_path, monkeypatch, n=3):
+    """A fresh run's tasks, and a label_frame counter armed for the next run."""
+    rels = _dataset(tmp_path, n=n)
+    _bars_everywhere(monkeypatch)
+    assert autolabel.main(["--root", str(tmp_path), "--no-sam"]) == 0
+    return rels, _tasks(tmp_path), _count_labels(monkeypatch)
+
+
+def test_resume_labels_only_the_frames_missing_from_the_checkpoint(tmp_path, monkeypatch, capsys):
+    rels, fresh, seen = _fresh_then(tmp_path, monkeypatch)
+    path = tmp_path / "autolabel" / autolabel.PASS1_NAME
+    first = path.read_text(encoding="utf-8").splitlines()[0]
+    path.write_text(first + "\n", encoding="utf-8")
+    capsys.readouterr()
+    assert autolabel.main(["--root", str(tmp_path), "--no-sam", "--resume"]) == 0
+    assert seen == rels[1:]
+    assert _tasks(tmp_path) == fresh
+    assert [line["file"] for line in _pass1(tmp_path)] == rels
+    assert "1 frames from the checkpoint" in capsys.readouterr().out
+
+
+def test_resume_ignores_a_cut_off_last_line(tmp_path, monkeypatch):
+    rels, fresh, seen = _fresh_then(tmp_path, monkeypatch)
+    path = tmp_path / "autolabel" / autolabel.PASS1_NAME
+    lines = path.read_text(encoding="utf-8").splitlines()
+    path.write_text(lines[0] + "\n" + lines[1][: len(lines[1]) // 2], encoding="utf-8")
+    assert autolabel.main(["--root", str(tmp_path), "--no-sam", "--resume"]) == 0
+    assert seen == rels[1:]
+    assert _tasks(tmp_path) == fresh
+    assert [line["file"] for line in _pass1(tmp_path)] == rels
+
+
+def test_resume_redoes_lines_from_another_model_version(tmp_path, monkeypatch):
+    rels, fresh, seen = _fresh_then(tmp_path, monkeypatch)
+    path = tmp_path / "autolabel" / autolabel.PASS1_NAME
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    lines[1]["version"] = "autolabel-v0"
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    assert autolabel.main(["--root", str(tmp_path), "--no-sam", "--resume"]) == 0
+    assert seen == [rels[1]]
+    assert _tasks(tmp_path) == fresh
+    assert all(line["version"] == autolabel.MODEL_VERSION for line in _pass1(tmp_path))
+
+
+def test_without_resume_the_checkpoint_is_not_reused(tmp_path, monkeypatch):
+    rels, fresh, seen = _fresh_then(tmp_path, monkeypatch)
+    boxes = tmp_path / "autolabel" / "boxes.jsonl"
+    boxes.write_text(json.dumps({"file": rels[0], "boxes": []}) + "\n", encoding="utf-8")
+    assert autolabel.main(["--root", str(tmp_path), "--no-sam"]) == 0
+    assert seen == rels
+    assert [line["file"] for line in _pass1(tmp_path)] == rels
+    assert not boxes.exists()
+    assert _tasks(tmp_path) == fresh
+
+
+def test_resume_hands_the_flag_to_the_sam_stage_and_counts_done_frames(
+    tmp_path, monkeypatch, capsys
+):
+    rels = _dataset(tmp_path, n=2)
+    _bars_everywhere(monkeypatch)
+    box = {"class": "enemy", "x": 755, "y": 310, "w": 90, "h": 95, "score": 0.9, "fallback": False}
+    work = tmp_path / "autolabel"
+    work.mkdir()
+    (work / "boxes.jsonl").write_text(
+        json.dumps({"file": rels[0], "boxes": [box]}) + "\n", encoding="utf-8"
+    )
+    seen = {}
+
+    def fake_segment(root, prompts, out, model, resume=False):
+        seen["resume"] = resume
+        with out.open("a", encoding="utf-8") as dst:
+            dst.write(json.dumps({"file": rels[1], "boxes": [box]}) + "\n")
+
+    monkeypatch.setattr(autolabel, "run_segment", fake_segment)
+    assert autolabel.main(["--root", str(tmp_path), "--resume"]) == 0
+    assert seen["resume"] is True
+    assert "1 SAM frames already done" in capsys.readouterr().out
+    labels = coco.from_labelstudio(_tasks(tmp_path), use_predictions=True)
+    assert set(labels) == set(rels)
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_run_segment_passes_resume_only_when_asked(tmp_path, monkeypatch, resume):
+    calls = []
+    monkeypatch.setattr(autolabel.shutil, "which", lambda name: "uv")
+    monkeypatch.setattr(autolabel.subprocess, "run", lambda args, **kw: calls.append(args))
+    prompts, out = tmp_path / "prompts.jsonl", tmp_path / "boxes.jsonl"
+    autolabel.run_segment(tmp_path, prompts, out, "some-model", resume=resume)
+    assert calls[0][:2] == ["uv", "run"]
+    assert ("--resume" in calls[0]) is resume

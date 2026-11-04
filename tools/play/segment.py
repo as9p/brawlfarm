@@ -17,7 +17,8 @@ so torch, transformers and PIL are imported only inside load_segmenter:
     uv run tools/play/segment.py --root D:/play-data --prompts prompts.jsonl --out boxes.jsonl
 
 Each prompts line names a frame and the bars found on it. Each output line repeats the frame
-and carries one box per bar, in bar order; a frame that is gone gets no boxes.
+and carries one box per bar, in bar order; a frame that is gone gets no boxes. --resume keeps
+the lines already in --out and segments only the frames they do not cover.
 """
 
 from __future__ import annotations
@@ -87,17 +88,43 @@ def _read_frame(path: Path) -> np.ndarray | None:
     return cv2.imdecode(np.frombuffer(path.read_bytes(), np.uint8), cv2.IMREAD_COLOR)
 
 
-def run(root: Path, prompts: Path, out: Path, segment: Segmenter) -> dict:
-    """Write one boxes line per prompts line, in order, and count what was written."""
-    summary = {"frames": 0, "boxes": 0, "fallbacks": 0, "missing": 0}
+def done_lines(out: Path) -> list[str]:
+    """The whole lines of an earlier boxes file; a last line cut off by a kill is left out."""
+    if not out.exists():
+        return []
+    kept = []
+    for line in out.read_text(encoding="utf-8").splitlines():
+        try:
+            blob = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(blob, dict) and "file" in blob:
+            kept.append(line)
+    return kept
+
+
+def run(root: Path, prompts: Path, out: Path, segment: Segmenter, resume: bool = False) -> dict:
+    """Write one boxes line per prompts line, in order, and count what was written.
+
+    With resume, the whole lines already in out are kept and their frames skipped, so a run
+    stopped part way picks up where it was. Every line is flushed as it is written.
+    """
+    summary = {"frames": 0, "boxes": 0, "fallbacks": 0, "missing": 0, "skipped": 0}
+    kept = done_lines(out) if resume else []
+    done = {json.loads(line)["file"] for line in kept}
+    # Rewritten without a cut-off last line, so the new lines append after a whole one.
+    out.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
     with (
         prompts.open(encoding="utf-8") as src,
-        out.open("w", encoding="utf-8") as dst,
+        out.open("a", encoding="utf-8") as dst,
     ):
         for line in src:
             if not line.strip():
                 continue
             row = json.loads(line)
+            if row["file"] in done:
+                summary["skipped"] += 1
+                continue
             summary["frames"] += 1
             frame = _read_frame(root / row["file"])
             boxes: list[dict] = []
@@ -117,6 +144,7 @@ def run(root: Path, prompts: Path, out: Path, segment: Segmenter) -> dict:
             summary["boxes"] += len(boxes)
             summary["fallbacks"] += sum(1 for box in boxes if box["fallback"])
             dst.write(json.dumps({"file": row["file"], "boxes": boxes}) + "\n")
+            dst.flush()
     return summary
 
 
@@ -132,6 +160,11 @@ def main(argv: list[str] | None = None) -> int:
         "--out", type=Path, required=True, help="boxes JSONL to write, one line per prompts line"
     )
     ap.add_argument("--model", default=DEFAULT_MODEL, help="SAM 2.1 model id or local folder")
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="keep the lines already in --out and skip their frames",
+    )
     args = ap.parse_args(argv)
 
     if not args.prompts.exists():
@@ -139,11 +172,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     segment = load_segmenter(args.model)
     started = time.perf_counter()
-    summary = run(args.root, args.prompts, args.out, segment)
+    summary = run(args.root, args.prompts, args.out, segment, resume=args.resume)
     per_frame = (time.perf_counter() - started) / max(1, summary["frames"])
     print(
         f"{summary['frames']} frames, {summary['boxes']} boxes, "
-        f"{summary['fallbacks']} fallbacks, {summary['missing']} missing"
+        f"{summary['fallbacks']} fallbacks, {summary['missing']} missing, "
+        f"{summary['skipped']} already done"
     )
     print(f"{per_frame:.2f} s per frame; wrote {args.out}")
     return 0

@@ -2,6 +2,7 @@
 
 uv run python tools/play/autolabel.py
 uv run python tools/play/autolabel.py --root D:/play-data --source yt-AAAAAAAAAAA --no-sam
+uv run python tools/play/autolabel.py --resume
 """
 
 from __future__ import annotations
@@ -19,11 +20,14 @@ import cv2
 import numpy as np
 
 from brawlfarm.core import jsonio
-from tools.play import brawlers, classes, dataset, prelabel, terrain, zones
+from tools.play import brawlers, classes, dataset, prelabel, segment, terrain, zones
 
 MODEL_VERSION = "autolabel-v1"
 OUT_NAME = "autolabel.json"
 SAM_MODEL = "facebook/sam2.1-hiera-large"
+# The first pass's checkpoint and the SAM output, both under <root>/autolabel/.
+PASS1_NAME = "pass1.jsonl"
+BOXES_NAME = "boxes.jsonl"
 
 
 class FrameLabels(NamedTuple):
@@ -96,27 +100,71 @@ def fixed_boxes(bars: list[brawlers.Bar]) -> list[dict]:
     return [brawlers.fallback_box(bar, dataset.FRAME_W, dataset.FRAME_H) for bar in bars]
 
 
-def run_segment(root: Path, prompts: Path, out: Path, model: str) -> None:
-    """Run segment.py in its own torch env; a failed run raises CalledProcessError."""
+def checkpoint_line(file: str, labels: FrameLabels) -> str:
+    """One pass1.jsonl line: everything the later passes need for a frame, and no OCR text."""
+    return json.dumps(
+        {
+            "version": MODEL_VERSION,
+            "file": file,
+            "template": labels.template,
+            "terrain": labels.terrain,
+            "bars": [bar.to_json() for bar in labels.bars],
+            "in_match": labels.in_match,
+        }
+    )
+
+
+def load_checkpoint(path: Path) -> tuple[dict[str, FrameLabels], int]:
+    """The first-pass labels a stopped run left behind, by file, and how many were stale.
+
+    A last line cut off by a kill and lines from another MODEL_VERSION are dropped, and the
+    file is rewritten without them so new lines append after a whole one.
+    """
+    done: dict[str, FrameLabels] = {}
+    kept: list[str] = []
+    stale = 0
+    for line in segment.done_lines(path):
+        blob = json.loads(line)
+        if blob.get("version") != MODEL_VERSION:
+            stale += 1
+            continue
+        done[blob["file"]] = FrameLabels(
+            blob["template"],
+            blob["terrain"],
+            [brawlers.Bar.from_json(bar) for bar in blob["bars"]],
+            blob["in_match"],
+        )
+        kept.append(line)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+    tmp.replace(path)
+    return done, stale
+
+
+def run_segment(root: Path, prompts: Path, out: Path, model: str, resume: bool = False) -> None:
+    """Run segment.py in its own torch env; a failed run raises CalledProcessError.
+
+    With resume, segment.py keeps the boxes already in out and segments only the rest.
+    """
     uv = shutil.which("uv")
     if uv is None:
         raise SystemExit("uv is not on PATH; the SAM pass runs through uv run")
-    subprocess.run(
-        [
-            uv,
-            "run",
-            str(Path(__file__).with_name("segment.py")),
-            "--root",
-            str(root),
-            "--prompts",
-            str(prompts),
-            "--out",
-            str(out),
-            "--model",
-            model,
-        ],
-        check=True,
-    )
+    args = [
+        uv,
+        "run",
+        str(Path(__file__).with_name("segment.py")),
+        "--root",
+        str(root),
+        "--prompts",
+        str(prompts),
+        "--out",
+        str(out),
+        "--model",
+        model,
+    ]
+    if resume:
+        args.append("--resume")
+    subprocess.run(args, check=True)
 
 
 def _zone(row: dict, exclusions: dict[str, list[zones.Rect]]) -> np.ndarray:
@@ -145,6 +193,11 @@ def main(argv: list[str] | None = None) -> int:
         "--no-sam", action="store_true", help="skip SAM; every brawler gets the fixed-size box"
     )
     ap.add_argument("--model", default=SAM_MODEL, help="SAM 2.1 model id or local folder")
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue a stopped run from its checkpoint instead of starting over",
+    )
     args = ap.parse_args(argv)
 
     root = args.root if args.root is not None else dataset.default_root()
@@ -159,42 +212,72 @@ def main(argv: list[str] | None = None) -> int:
     )
     ocr = ocr_engine()
 
+    # A fresh run drops what an earlier run left; --resume picks it up instead.
+    work = root / "autolabel"
+    work.mkdir(parents=True, exist_ok=True)
+    pass1 = work / PASS1_NAME
+    out = work / BOXES_NAME
+    done: dict[str, FrameLabels] = {}
+    if not args.resume:
+        pass1.unlink(missing_ok=True)
+        out.unlink(missing_ok=True)
+    elif pass1.exists():
+        done, stale = load_checkpoint(pass1)
+        if stale:
+            # Frames relabelled by newer code may carry other bars, so SAM starts over too.
+            print(f"{stale} checkpoint lines are from another auto-labeller; redoing them")
+            out.unlink(missing_ok=True)
+
     # First pass: templates, terrain and bars per frame. Frames and zone masks are dropped as
-    # soon as their frame is done, so memory grows with the labels, not the frames.
+    # soon as their frame is done, so memory grows with the labels, not the frames. Each
+    # labelled frame is appended to the checkpoint and flushed, so a stop keeps it.
     kept: list[tuple[dict, FrameLabels]] = []
     missing = 0
     failed = 0
-    for row in dataset.index_rows(root):
-        if wanted is not None and row["source"] not in wanted:
-            continue
-        bgr = prelabel._read_frame(root / row["file"])
-        if bgr is None:
-            # The index outlives the files, so a deleted frame is reported, not fatal.
-            missing += 1
-            continue
-        try:
-            kept.append((row, label_frame(bgr, row, _zone(row, exclusions), ocr)))
-        except Exception as exc:  # one bad frame must not cost the whole run
-            print(f"{row['file']}: {type(exc).__name__}: {exc}")
-            failed += 1
+    resumed = 0
+    with pass1.open("a", encoding="utf-8") as checkpoint:
+        for row in dataset.index_rows(root):
+            if wanted is not None and row["source"] not in wanted:
+                continue
+            if row["file"] in done and (root / row["file"]).exists():
+                kept.append((row, done[row["file"]]))
+                resumed += 1
+                continue
+            bgr = prelabel._read_frame(root / row["file"])
+            if bgr is None:
+                # The index outlives the files, so a deleted frame is reported, not fatal.
+                missing += 1
+                continue
+            try:
+                labels = label_frame(bgr, row, _zone(row, exclusions), ocr)
+            except Exception as exc:  # one bad frame must not cost the whole run
+                print(f"{row['file']}: {type(exc).__name__}: {exc}")
+                failed += 1
+                continue
+            kept.append((row, labels))
+            checkpoint.write(checkpoint_line(row["file"], labels) + "\n")
+            checkpoint.flush()
 
     # Second pass: a box per bar, from SAM or the fixed size. SAM never runs with nothing to do.
     with_bars = [(row, labels) for row, labels in kept if labels.bars]
     boxes: dict[str, list[dict]] = {}
+    sam_done = 0
     if args.no_sam:
         boxes = {row["file"]: fixed_boxes(labels.bars) for row, labels in with_bars}
     elif with_bars:
-        work = root / "autolabel"
-        work.mkdir(parents=True, exist_ok=True)
         prompts = work / "prompts.jsonl"
-        out = work / "boxes.jsonl"
         lines = [
             json.dumps({"file": row["file"], "bars": [bar.to_json() for bar in labels.bars]})
             for row, labels in with_bars
         ]
         prompts.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+        if args.resume:
+            prompted = {row["file"] for row, _ in with_bars}
+            sam_done = sum(
+                1 for line in segment.done_lines(out) if json.loads(line)["file"] in prompted
+            )
         try:
-            run_segment(root, prompts, out, args.model)
+            run_segment(root, prompts, out, args.model, resume=args.resume)
         except subprocess.CalledProcessError:
             print("the SAM pass failed; nothing written. Rerun it, or pass --no-sam")
             return 1
@@ -228,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(tasks)} frames, {matched} in a match, {missing} missing, {failed} failed, "
         f"{fixed} fixed brawler boxes"
     )
+    print(f"{resumed} frames from the checkpoint, {sam_done} SAM frames already done")
     for cls in classes.CLASSES:
         if per_class[cls]:
             print(f"  {cls} {per_class[cls]}")
