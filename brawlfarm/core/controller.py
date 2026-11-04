@@ -36,6 +36,7 @@ from brawlfarm.core import (
     captures,
     config,
     farmplan,
+    game_update,
     match_vision,
     preview,
     questpick,
@@ -202,6 +203,7 @@ class Controller:
         self._ceremony_count = 0  # ceremony screens cleared in the current run cycle
         self._playing_modal_i = 0  # in-match iteration counter for the modal scan
         self._dismiss_tried = False  # recover() soft dismiss-ladder used this cycle
+        self._update_checked = False  # game auto-update store check used this run (never reset)
 
     # --- small helpers -------------------------------------------------------
 
@@ -1429,6 +1431,15 @@ class Controller:
         if soft is not None:
             self.stop(f"recover_while_stopping:{soft}:{reason}")
             return
+        # Game auto-update (2026-11-04): a new client opens to an update prompt that no
+        # relaunch fixes. On the SECOND recovery of the run (the first relaunch did not
+        # help), check the Play Store once. A failed update has already stopped the run.
+        if (
+            self.recovery_attempts == config.GAME_UPDATE_ON_ATTEMPT
+            and not self._update_checked
+            and not self._check_game_update()
+        ):
+            return
         try:
             adb.go_home()
             time.sleep(2)
@@ -1440,6 +1451,50 @@ class Controller:
             self.dl.event("recover_error", err=str(e))
         self.last_change = time.monotonic()
         self.set_phase("returning")
+
+    def _game_update_effects(self) -> game_update.Effects:
+        return game_update.Effects(
+            open_store=lambda: adb.open_store_page(config.BS_PACKAGE),
+            foreground=adb.current_package,
+            screenshot=adb.screencap,
+            read_boxes=vision.read_lines_boxes,
+            tap=lambda pt: self.tap(pt, kind="store_update"),
+            version=lambda: adb.package_version(config.BS_PACKAGE),
+            sleep=time.sleep,
+            clock=time.monotonic,
+        )
+
+    def _check_game_update(self) -> bool:
+        """Run the once-per-run Play Store check. True: carry on with the relaunch.
+        False: the update failed and the run stopped (alert via the "stop" event)."""
+        self._update_checked = True
+        self.log("RECOVER: checking the Play Store for a game update")
+        try:
+            out = game_update.try_update(self._game_update_effects())
+        except Exception as e:
+            # try_update only catches AdbError: an OCR/numpy error from the screenshot
+            # or read_boxes path lands here and takes the FAILED path below.
+            out = game_update.Outcome(game_update.UpdateResult.FAILED, f"error: {type(e).__name__}")
+        if out.result is game_update.UpdateResult.UPDATED:
+            self.dl.event("game_updated", old=out.old, new=out.new)
+            self.log(f"game updated {out.old} -> {out.new}")
+            self.recovery_attempts = 0  # the fresh client gets the full recovery budget
+            return True
+        if out.result is game_update.UpdateResult.NO_UPDATE:
+            self.dl.event("update_check", result="none", reason=out.reason)
+            return True
+        try:
+            self.event_shot(adb.screencap(), "update_failed")
+        except Exception:
+            pass
+        try:
+            adb.go_home()  # leave the store before stop() closes the game
+        except Exception:
+            pass
+        self.dl.event("update_failed", reason=out.reason)
+        self.log(f"game update failed ({out.reason}) -> stopping")
+        self.stop("update_failed")
+        return False
 
     def stop(self, reason: str) -> None:
         if not self.running:
