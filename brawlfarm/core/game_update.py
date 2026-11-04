@@ -83,6 +83,8 @@ def try_update(fx: Effects) -> Outcome:
         point = pick_update_button(fx.read_boxes(fx.screenshot()))
         if point is None:
             return Outcome(UpdateResult.NO_UPDATE, "no_update_button", old=old)
+        if fx.foreground() != config.PLAY_STORE_PACKAGE:
+            return Outcome(UpdateResult.FAILED, "store_not_foreground", old=old)
         fx.tap(point)
         deadline = fx.clock() + config.GAME_UPDATE_TIMEOUT_S
         while fx.clock() < deadline:

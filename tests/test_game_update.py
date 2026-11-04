@@ -17,9 +17,13 @@ def _fx(*, fg=STORE, lines=(UNINSTALL, UPDATE), versions=("1.0", "1.0", "2.0"), 
     calls: list = []
     t = [0.0]
     vs = list(versions)
+    fgs = [fg] if isinstance(fg, str) else list(fg)
 
     def version():
         return vs.pop(0) if len(vs) > 1 else vs[0]
+
+    def foreground():
+        return fgs.pop(0) if len(fgs) > 1 else fgs[0]
 
     def open_store():
         calls.append("open")
@@ -31,7 +35,7 @@ def _fx(*, fg=STORE, lines=(UNINSTALL, UPDATE), versions=("1.0", "1.0", "2.0"), 
 
     fx = Effects(
         open_store=open_store,
-        foreground=lambda: fg,
+        foreground=foreground,
         screenshot=lambda: np.zeros((900, 1600, 3), np.uint8),
         read_boxes=lambda img: list(lines),
         tap=lambda pt: calls.append(("tap", pt)),
@@ -75,6 +79,14 @@ def test_version_never_changes_fails_after_timeout() -> None:
 
 def test_store_never_reaches_foreground_fails_without_tapping() -> None:
     fx, calls, _ = _fx(fg="com.supercell.brawlstars")
+    out = game_update.try_update(fx)
+    assert out.result is UpdateResult.FAILED
+    assert out.reason == "store_not_foreground"
+    assert calls == ["open"]
+
+
+def test_store_leaves_foreground_before_tap_fails_without_tapping() -> None:
+    fx, calls, _ = _fx(fg=(STORE, "com.supercell.brawlstars"))
     out = game_update.try_update(fx)
     assert out.result is UpdateResult.FAILED
     assert out.reason == "store_not_foreground"
