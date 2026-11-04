@@ -175,6 +175,10 @@ class Controller:
         self._ability_last: dict[str, float] = {}
         # Fast re-entry + status-heartbeat + mid-session brawler-switch bookkeeping.
         self._unknown_streak = 0  # consecutive UNKNOWN frames (detects the home screen fast)
+        # UNKNOWN-path handler repeat guard (_unknown_modal): which handler branch the last
+        # loop iteration took, and how many iterations in a row took it.
+        self._repeat_handler: str | None = None
+        self._repeat_count = 0
         self._loop_i = 0  # loop counter; throttles the status heartbeat write
         self._farm_brawler = None  # API name of the brawler we grind (for the goal switch)
         # Trophy goal for the farmed brawler: the farm plan (core/farmplan.py) can set a
@@ -1337,15 +1341,31 @@ class Controller:
         self.last_move = 0.0
         self.set_phase("playing")
 
-    def handle_daily_streak(self) -> None:
+    def handle_daily_streak(self, screen) -> None:
         """The DAILY STREAK login-reward popup (auto-appears once a day, blocks the menu).
-        Tap CLAIM to collect the free reward — claiming clears it for the day, whereas its ✕
-        can re-pop — then switch to the returning flow, which taps through the Starr-Drop
-        reveal that follows and any rank-up trophy screen back to the menu. Never costs
-        gems/money. This is what breaks the match_timeout loop a stuck streak popup caused."""
-        self.dl.event("daily_streak_claim")
-        self.log("DAILY STREAK popup -> CLAIM")
-        self.tap(config.DAILY_STREAK_CLAIM, kind="daily_streak_claim")
+        Verify then act, never a blind tap: (1) tap the OCR'd CLAIM word to collect the free
+        reward — claiming clears it for the day, whereas its ✕ can re-pop; (2) no CLAIM (the
+        day-1 variant has none) -> tap the popup's red ✕, matched at a local threshold and
+        only in its top-right area; (3) neither -> one Android BACK. Then switch to the
+        returning flow, which taps through the Starr-Drop reveal that follows and any rank-up
+        trophy screen back to the menu. Never costs gems/money. A popup none of these clears
+        is caught by the repeat guard in _unknown_modal (recover("daily_streak_stuck"))."""
+        claim = vision.find_text(screen, "CLAIM", region=config.DAILY_STREAK_CLAIM_REGION)
+        if claim is not None:
+            self.dl.event("daily_streak_claim")
+            self.log("DAILY STREAK popup -> CLAIM")
+            self.tap(claim, kind="daily_streak_claim")
+        else:
+            m = vision.find(screen, "close_x", threshold=config.DAILY_STREAK_CLOSE_X_THRESHOLD)
+            x1, y1, x2, y2 = config.DAILY_STREAK_CLOSE_X_REGION
+            if m is not None and x1 <= m.x < x2 and y1 <= m.y < y2:
+                self.dl.event("popup_close", popup="daily_streak", action="close_x")
+                self.log(f"DAILY STREAK popup (no CLAIM) -> close ✕ ({m.confidence:.3f})")
+                self.tap(m.center, kind="close_x")
+            else:
+                self.dl.event("popup_close", popup="daily_streak", action="back")
+                self.log("DAILY STREAK popup (no CLAIM, no ✕) -> BACK")
+                adb.keyevent(4)
         time.sleep(config.TAP_SETTLE)
         self.set_phase("returning")  # clear the Starr-drop reveal + any trophy screen
 
@@ -1363,6 +1383,44 @@ class Controller:
         time.sleep(0.6)
         self.tap(config.INVITE_REJECT_BUTTON, kind="invite_reject")
         time.sleep(config.TAP_SETTLE)
+
+    def _unknown_modal(self, screen, state) -> bool:
+        """The off-hot-path modal checks on UNKNOWN frames (daily streak, team invite).
+        Runs the matching handler through the repeat guard and returns True when one ran,
+        so the loop skips the rest of the tick; returns False (and clears the guard: some
+        other branch is about to run) otherwise."""
+        if state == State.UNKNOWN:
+            # DAILY STREAK login-reward popup: blocks the menu, close_x misses its ✕, and
+            # it survives game-relaunch recovery -> a match_timeout loop.
+            if states.is_daily_streak(screen):
+                self._guarded_handler("daily_streak", self.handle_daily_streak, screen)
+                return True
+            # TEAM INVITE modal. It can classify as UNKNOWN (menu fully blocked); the
+            # MENU-but-PLAY-eaten variant is caught in phase_queuing before the PLAY re-press.
+            if states.is_team_invite(screen):
+                self._guarded_handler("team_invite", self.handle_team_invite, screen)
+                return True
+        self._clear_handler_repeat()
+        return False
+
+    def _guarded_handler(self, name: str, handler, screen) -> None:
+        """Run `handler(screen)` unless the same handler branch has now run
+        config.HANDLER_REPEAT_MAX loop iterations in a row; then recover("<name>_stuck")
+        instead. These branches `continue` past the UNKNOWN streak counter and
+        check_freeze, so without this a modal the handler can't clear loops forever
+        (2026-11-04: 40 minutes and 1442 taps on a Daily Streak popup)."""
+        if name == self._repeat_handler:
+            self._repeat_count += 1
+        else:
+            self._repeat_handler, self._repeat_count = name, 1
+        if self._repeat_count >= config.HANDLER_REPEAT_MAX:
+            self._clear_handler_repeat()
+            self.recover(f"{name}_stuck")
+            return
+        handler(screen)
+
+    def _clear_handler_repeat(self) -> None:
+        self._repeat_handler, self._repeat_count = None, 0
 
     def handle_popup(self, screen) -> None:
         """Promo/news/offer popup → close it. Tiered strategy (per the scenarios doc):
@@ -1729,22 +1787,17 @@ class Controller:
                     # A disconnect modal can overlay any screen — handle it first so we
                     # don't mistake it for RESULTS and don't trip freeze detection.
                     if state == State.DISCONNECT:
+                        self._clear_handler_repeat()
                         self.handle_disconnect(screen)
                         continue
                     if state == State.POPUP:
+                        self._clear_handler_repeat()
                         self.handle_popup(screen)
                         continue
-                    # DAILY STREAK login-reward popup: blocks the menu, close_x misses its ✕,
-                    # and it survives game-relaunch recovery -> a match_timeout loop. Detect it
-                    # (only on UNKNOWN frames, to keep the hot path cheap) and CLAIM it.
-                    if state == State.UNKNOWN and states.is_daily_streak(screen):
-                        self.handle_daily_streak()
-                        continue
-                    # TEAM INVITE modal: same off-hot-path OCR gate as the streak. It can
-                    # classify as UNKNOWN (menu fully blocked) — the MENU-but-PLAY-eaten
-                    # variant is caught in phase_queuing before the PLAY re-press.
-                    if state == State.UNKNOWN and states.is_team_invite(screen):
-                        self.handle_team_invite(screen)
+                    # DAILY STREAK and TEAM INVITE modals: OCR-detected only on UNKNOWN
+                    # frames (keeps the hot path cheap), handled under a repeat guard that
+                    # escalates to recover() when the same handler keeps coming back.
+                    if self._unknown_modal(screen, state):
                         continue
                     # Fast re-entry: a sustained UNKNOWN can mean the game dropped to the
                     # BlueStacks/Android home (crash/exit). Don't wait out the ~6-min
