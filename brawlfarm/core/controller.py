@@ -1439,7 +1439,7 @@ class Controller:
         if self.popup_count <= 2:
             # Prefer the live ✕ location; fall back to the configured promo coord.
             m = vision.find(screen, "close_x")
-            point = (int(m.x + m.w / 2), int(m.y + m.h / 2)) if m else config.CLOSE_X_BUTTON
+            point = m.center if m else config.CLOSE_X_BUTTON
             self.tap(point, kind="close_x")
         elif self.popup_count <= 6:
             adb.keyevent(4)  # BACK — reliable across varied ✕ styles/positions
