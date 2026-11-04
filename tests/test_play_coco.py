@@ -98,30 +98,85 @@ def test_split_key_reads_a_time_that_follows_the_source_name():
 
 def test_split_key_keeps_a_youtube_source_whole():
     assert coco.split_key("yt-00000000001", "20261104-063119-00133.jpg") == "yt-00000000001"
+    # frames.py numbers a video's frames too, and a video is still never cut into blocks
+    assert coco.split_key("yt-00000000001", "yt-00000000001-000999.jpg") == "yt-00000000001"
+
+
+def test_split_key_of_a_numbered_session_frame_is_its_block():
+    assert coco.SESSION_BLOCK_FRAMES == 60
+    # how frames.py names a saved frame: the source, then a number, no time
+    assert coco.split_key("capture-20261104", "capture-20261104-000003.jpg") == (
+        "capture-20261104@b0"
+    )
+    # a recorder session is named after its start, which is not the frame's time
+    assert coco.split_key("20260916-223234", "20260916-223234-000123.jpg") == ("20260916-223234@b2")
+
+
+def test_split_key_starts_a_block_at_each_multiple_of_the_block_size():
+    size = coco.SESSION_BLOCK_FRAMES
+    keys = {
+        n: coco.split_key("capture-20261104", f"capture-20261104-{n:06d}.jpg")
+        for n in (0, size - 1, size, 2 * size - 1, 2 * size)
+    }
+
+    assert keys[0] == keys[size - 1] == "capture-20261104@b0"
+    assert keys[size] == keys[2 * size - 1] == "capture-20261104@b1"
+    assert keys[2 * size] == "capture-20261104@b2"
+
+
+@pytest.mark.parametrize(
+    ("frames", "fewest", "most"),
+    [
+        # a 30-minute capture at one frame per 3 s
+        (600, 8, 12),
+        # the recorder session in the dataset
+        (138, 2, 3),
+    ],
+)
+def test_split_key_cuts_a_sitting_into_a_handful_of_blocks(frames, fewest, most):
+    keys = {coco.split_key("capture", f"capture-{n:06d}.jpg") for n in range(frames)}
+
+    assert fewest <= len(keys) <= most
+
+
+def test_split_key_prefers_a_time_in_the_name_to_the_frame_number():
+    timed = [
+        coco.split_key("capture-20261104b", "capture-20261104b-20261104-063119-000133.jpg"),
+        coco.split_key("capture-20261104b", "20261104-063119-000133.jpg"),
+    ]
+
+    assert timed == ["capture-20261104b@20261104-0630"] * 2
+    assert coco.split_key("capture-20261104b", "capture-20261104b-000133.jpg") == (
+        "capture-20261104b@b2"
+    )
 
 
 @pytest.mark.parametrize(
     ("source", "name"),
     [
-        # how frames.py names a saved frame: a number, no time
-        ("capture-20261104", "capture-20261104-000003.jpg"),
-        # a recorder session is named after its start, which is not the frame's time
-        ("20260916-223234", "20260916-223234-000123.jpg"),
         ("capture-20261104", "20261399-256199-00001.jpg"),
+        ("capture-20261104", "capture-20261104-20261399-256199.jpg"),
         ("capture-20261104", "0001-menu.jpg"),
+        # another source's number, a number with more after it, not a JPEG, no number at all
+        ("capture-20261104", "capture-other-000003.jpg"),
+        ("capture-20261104", "capture-20261104-000003-menu.jpg"),
+        ("capture-20261104", "capture-20261104-000003.png"),
+        ("capture-20261104", "capture-20261104-.jpg"),
     ],
 )
-def test_split_key_falls_back_to_the_whole_source_without_a_time(source, name):
+def test_split_key_falls_back_to_the_whole_source_without_a_time_or_a_number(source, name):
     assert coco.split_key(source, name) == source
 
 
 def test_split_key_is_the_same_every_run():
     names = _session_names(6)
+    numbered = [f"capture-20261104b-{n:06d}.jpg" for n in range(600)]
 
-    first = [coco.split_key("capture-20261104b", name) for name in names]
+    first = [coco.split_key("capture-20261104b", name) for name in names + numbered]
 
-    assert first == [coco.split_key("capture-20261104b", name) for name in names]
-    assert len(set(first)) == 6
+    assert first == [coco.split_key("capture-20261104b", name) for name in names + numbered]
+    assert len(set(first[: len(names)])) == 6
+    assert len(set(first[len(names) :])) == 10
 
 
 def test_only_the_template_anchors_have_a_label_source():
@@ -275,7 +330,8 @@ def test_build_writes_three_splits_covering_every_frame(tmp_path):
     assert total == 6
     assert summary["smoke"] is False
     assert summary["boxes"]["play_button"] == 6
-    assert set(summary["sources"]) == {"alpha", "beta", "gamma"}
+    # Numbered frames.py names, so each source's frames make up its first block.
+    assert set(summary["sources"]) == {"alpha@b0", "beta@b0", "gamma@b0"}
     assert json.loads((root / "coco" / "split.json").read_text(encoding="utf-8")) == summary
 
 
@@ -376,6 +432,28 @@ def test_build_splits_a_session_by_window_and_a_video_whole(tmp_path):
     assert sum(summary["frames"].values()) == len(rels)
 
 
+def test_build_splits_a_numbered_session_by_block_and_a_video_whole(tmp_path):
+    root = tmp_path / "play"
+    videos = ["yt-00000000001", "yt-00000000002", "yt-00000000003"]
+    rels = _write_frames(root, videos)
+    # How frames.py saves a session: numbered names with no time, here two frames per block.
+    numbers = range(0, 24 * coco.SESSION_BLOCK_FRAMES, coco.SESSION_BLOCK_FRAMES // 2)
+    rels += _write_named(
+        root, "capture-20261104", [f"capture-20261104-{n:06d}.jpg" for n in numbers]
+    )
+    labels = {rel: [] for rel in rels}
+
+    summary = coco.build(root, labels)
+
+    blocks = [key for key in summary["sources"] if key.startswith("capture-20261104@b")]
+    assert len(blocks) == 24
+    assert set(videos) <= set(summary["sources"])
+    assert "capture-20261104" not in summary["sources"]
+    assert len({summary["sources"][key] for key in blocks}) > 1
+    assert sum(summary["frames"].values()) == len(rels)
+    assert coco.build(root, dict(reversed(list(labels.items())))) == summary
+
+
 def test_build_gives_the_same_split_whatever_the_order_of_the_labels(tmp_path):
     root = tmp_path / "play"
     rels = _write_frames(root, ["yt-00000000001"])
@@ -444,3 +522,19 @@ def test_train_describe_lists_classes_with_no_boxes(capsys):
     out = capsys.readouterr().out
     assert "  close_x 0\n" in out
     assert "  play_button 3\n" in out
+
+
+def test_train_describe_counts_split_keys_not_sources(capsys):
+    summary = {
+        "sources": {"capture@b0": "train", "capture@b1": "valid", "capture@b2": "test"},
+        "smoke": False,
+        "frames": {"train": 1, "valid": 1, "test": 1},
+        "boxes": {"play_button": 3},
+        "training_set_hash": "0" * 64,
+    }
+
+    train.describe(summary)
+
+    out = capsys.readouterr().out
+    assert "3 split keys: test 1, train 1, valid 1\n" in out
+    assert "sources" not in out

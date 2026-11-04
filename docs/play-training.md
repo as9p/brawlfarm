@@ -299,13 +299,19 @@ always keeps the largest split.
 A YouTube source (`yt-<video id>`) is one key: the whole video goes to one split. A recorder or
 capture session is one long sitting, and hashed whole it would put every frame it holds, and
 every tap anchor it shows, on one side, which leaves valid and test with no tap-anchor truth.
-So a session frame whose file name carries a time, such as `20261104-063119-00133.jpg`, is keyed
-by its 5-minute window instead (`WINDOW_MINUTES` in `coco.py`). The key is `<session>@<window>`,
-for example `capture-20261104b@20261104-0630`, and the frames of one window always stay
-together. A frame whose name carries no time falls back to its whole source as the key. A
-recorder session is named after the second it started, and that stamp is never read as a frame's
-time. `frames.py` saves frames as `<source>-<number>.jpg`, which carries no time, so until it
-keeps the time in the saved name, every session in the dataset still goes to one split whole.
+So a session is cut into contiguous pieces, and each piece is its own key. A session frame whose
+file name carries a time, such as `20261104-063119-00133.jpg`, is keyed by its 5-minute window
+(`WINDOW_MINUTES` in `coco.py`). The key is `<session>@<window>`, for example
+`capture-20261104b@20261104-0630`. `frames.py` saves frames as `<source>-<number>.jpg`, which
+carries no time, but it numbers a session's frames upwards in the order they were captured. So a
+frame named that way is keyed by its block of 60 frames instead (`SESSION_BLOCK_FRAMES` in
+`coco.py`). The key is `<session>@b<block>`, the frame number divided by 60 and rounded down, so
+`capture-20261104-000123.jpg` is in `capture-20261104@b2`. Sixty frames is three minutes of a
+capture at one frame every 3 seconds: a 30-minute capture becomes ten keys and a 138-frame
+recorder session three. A time in the name always wins over a number, and the frames of one
+window or block always stay together. A recorder session is named after the second it started,
+and that stamp is never read as a frame's time. A frame whose name carries neither a time nor its
+source's frame number falls back to its whole source as the key.
 With fewer than three split keys there is not enough to split at all, so `coco.py` writes the
 same frames into all three splits and marks the layout as a smoke set; every later tool in this
 kit warns when it sees that mark.

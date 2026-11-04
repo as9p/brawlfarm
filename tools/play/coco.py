@@ -4,7 +4,8 @@ The split is by source video, never by frame: consecutive frames of one video lo
 frame-wise split would put near-copies on both sides of it and score a model on pictures it has
 already seen. A source is assigned by hashing its name, which keeps the split stable when more
 videos are added later. A recorder or capture session is one long sitting, though, so it is
-split by time window instead: each window of WINDOW_MINUTES is its own split key. Frames with
+cut into contiguous pieces instead: each window of WINDOW_MINUTES, or each block of
+SESSION_BLOCK_FRAMES frames when the frame names carry no time, is its own split key. Frames with
 no boxes are kept: a detector needs to be shown the screens where there is nothing to find.
 
     uv run python tools/play/coco.py export.json
@@ -35,9 +36,16 @@ SMOKE_MIN = 3
 # side of the split, which leaves valid and test with no anchor truth at all. So a session frame
 # is keyed by the window of this many minutes its file name's time falls in.
 WINDOW_MINUTES = 5
+# frames.py saves a frame as `<source>-<number>.jpg`, with no time in the name, and numbers a
+# session's frames upwards in the order they were captured. Such a frame is keyed by its block of
+# this many frames instead. 60 frames is three minutes of a capture taken at one frame per 3 s,
+# so a 30-minute capture becomes ten keys and the 138-frame recorder session three: enough for
+# one sitting to reach valid and test, while each cut puts only the two frames that meet at it,
+# near-copies of each other, on different sides of the split.
+SESSION_BLOCK_FRAMES = 60
 # ingest_youtube.py names a video's source yt-<video id>; a video is always split whole.
 YOUTUBE_PREFIX = "yt-"
-# Joins a session to its window in a split key. A source name can never hold it.
+# Joins a session to its window or block in a split key. A source name can never hold it.
 WINDOW_MARK = "@"
 STAMP_RE = re.compile(r"(?<!\d)(\d{8})-(\d{6})(?!\d)")
 # A tap anchor needs this many truth boxes in valid and in test before a threshold or a score
@@ -66,19 +74,30 @@ def _frame_time(source: str, file_name: str) -> datetime | None:
         return None
 
 
+def _frame_number(source: str, file_name: str) -> int | None:
+    """The number in a frame name of the form frames.py saves, `<source>-<number>.jpg`, or None."""
+    match = re.fullmatch(rf"{re.escape(source)}-([0-9]+)\.jpg", Path(file_name).name)
+    return None if match is None else int(match.group(1))
+
+
 def split_key(source: str, file_name: str) -> str:
-    """What a frame is split by: its source, or `<session>@<window>` for a session frame.
+    """What a frame is split by: its source, or `<session>@<window>` or `<session>@b<block>`.
 
     A YouTube video stays whole. Any other source whose frame names carry a time is cut into
-    windows of WINDOW_MINUTES, each named after its first minute, so the frames of one window
-    always land together and a frame gets the same key every run. A frame with no time in its
-    name falls back to its whole source.
+    windows of WINDOW_MINUTES, each named after its first minute. A frame with no time in its
+    name but saved under a number by frames.py goes by its block of SESSION_BLOCK_FRAMES
+    instead, so a time in the name always wins over a number. Either way the frames of one
+    window or block always land together and a frame gets the same key every run. A frame with
+    neither falls back to its whole source.
     """
     if source.startswith(YOUTUBE_PREFIX):
         return source
     when = _frame_time(source, file_name)
     if when is None:
-        return source
+        number = _frame_number(source, file_name)
+        if number is None:
+            return source
+        return f"{source}{WINDOW_MARK}b{number // SESSION_BLOCK_FRAMES}"
     minutes = when.hour * 60 + when.minute
     start = minutes - minutes % WINDOW_MINUTES
     return f"{source}{WINDOW_MARK}{when:%Y%m%d}-{start // 60:02d}{start % 60:02d}"
