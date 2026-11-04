@@ -46,9 +46,9 @@ def describe(summary: dict) -> None:
     """Print what is about to be trained on, loudly enough that a smoke set is not mistaken."""
     counts = ", ".join(f"{name} {count}" for name, count in sorted(summary["frames"].items()))
     print(f"{len(summary['sources'])} sources: {counts}")
+    # Every class, zeros included: a class with no boxes trains nothing and should be seen.
     for name, count in sorted(summary["boxes"].items()):
-        if count:
-            print(f"  {name} {count}")
+        print(f"  {name} {count}")
     print(f"training set hash {summary['training_set_hash'][:16]}")
     if summary["smoke"]:
         print("")

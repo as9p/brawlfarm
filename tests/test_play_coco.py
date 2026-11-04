@@ -7,13 +7,14 @@ tool has to survive, including a cancelled annotation and a path that tries to l
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
-from tools.play import classes, coco
+from tools.play import classes, coco, train
 
 
 def _task(rel: str, boxes: list[tuple[str, float, float, float, float]], **kw) -> dict:
@@ -54,6 +55,82 @@ def _write_frames(root: Path, sources: list[str], per_source: int = 2) -> list[s
             path.write_bytes(buf.tobytes())
             rels.append(rel)
     return rels
+
+
+def _write_named(root: Path, source: str, names: list[str]) -> list[str]:
+    rels = []
+    for n, name in enumerate(names, start=1):
+        rel = f"frames/{source}/{name}"
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ok, buf = cv2.imencode(".jpg", np.full((90, 160, 3), n % 250, dtype=np.uint8))
+        assert ok
+        path.write_bytes(buf.tobytes())
+        rels.append(rel)
+    return rels
+
+
+def _session_names(windows: int) -> list[str]:
+    """Two frames per five-minute window of a capture: the window's first second and its last."""
+    names = []
+    for window in range(windows):
+        for offset in (0, 299):
+            when = datetime(2026, 11, 4, 6, 0) + timedelta(minutes=5 * window, seconds=offset)
+            names.append(f"{when:%Y%m%d-%H%M%S}-{len(names):05d}.jpg")
+    return names
+
+
+def test_split_key_of_a_session_frame_is_its_five_minute_window():
+    first = coco.split_key("capture-20261104b", "20261104-063000-00120.jpg")
+    last = coco.split_key("capture-20261104b", "20261104-063459-00133.jpg")
+    after = coco.split_key("capture-20261104b", "20261104-063500-00134.jpg")
+
+    assert coco.WINDOW_MINUTES == 5
+    assert first == last == "capture-20261104b@20261104-0630"
+    assert after == "capture-20261104b@20261104-0635"
+
+
+def test_split_key_reads_a_time_that_follows_the_source_name():
+    key = coco.split_key("capture-20261104b", "capture-20261104b-20261104-063119-000133.jpg")
+
+    assert key == "capture-20261104b@20261104-0630"
+
+
+def test_split_key_keeps_a_youtube_source_whole():
+    assert coco.split_key("yt-00000000001", "20261104-063119-00133.jpg") == "yt-00000000001"
+
+
+@pytest.mark.parametrize(
+    ("source", "name"),
+    [
+        # how frames.py names a saved frame: a number, no time
+        ("capture-20261104", "capture-20261104-000003.jpg"),
+        # a recorder session is named after its start, which is not the frame's time
+        ("20260916-223234", "20260916-223234-000123.jpg"),
+        ("capture-20261104", "20261399-256199-00001.jpg"),
+        ("capture-20261104", "0001-menu.jpg"),
+    ],
+)
+def test_split_key_falls_back_to_the_whole_source_without_a_time(source, name):
+    assert coco.split_key(source, name) == source
+
+
+def test_split_key_is_the_same_every_run():
+    names = _session_names(6)
+
+    first = [coco.split_key("capture-20261104b", name) for name in names]
+
+    assert first == [coco.split_key("capture-20261104b", name) for name in names]
+    assert len(set(first)) == 6
+
+
+def test_only_the_template_anchors_have_a_label_source():
+    assert coco.LABELLED_ANCHORS == frozenset(classes.TEMPLATE_CLASS.values())
+    assert classes.TAP_ANCHORS - coco.LABELLED_ANCHORS == {
+        "skull_star",
+        "team_up_panel",
+        "event_tab",
+    }
 
 
 def test_split_of_is_stable_and_not_the_same_for_every_source():
@@ -280,3 +357,90 @@ def test_build_refuses_to_write_an_empty_training_set(tmp_path):
 
     with pytest.raises(ValueError, match="no training frames"):
         coco.build(root, {})
+
+
+def test_build_splits_a_session_by_window_and_a_video_whole(tmp_path):
+    root = tmp_path / "play"
+    videos = ["yt-00000000001", "yt-00000000002", "yt-00000000003"]
+    rels = _write_frames(root, videos)
+    rels += _write_named(root, "capture-20261104b", _session_names(24))
+
+    summary = coco.build(root, {rel: [] for rel in rels})
+
+    windows = [key for key in summary["sources"] if key.startswith("capture-20261104b@")]
+    assert len(windows) == 24
+    assert set(videos) <= set(summary["sources"])
+    assert "capture-20261104b" not in summary["sources"]
+    # The point of the windows: one long sitting no longer lands on a single side of the split.
+    assert len({summary["sources"][key] for key in windows}) > 1
+    assert sum(summary["frames"].values()) == len(rels)
+
+
+def test_build_gives_the_same_split_whatever_the_order_of_the_labels(tmp_path):
+    root = tmp_path / "play"
+    rels = _write_frames(root, ["yt-00000000001"])
+    rels += _write_named(root, "capture-20261104b", _session_names(12))
+    labels = {rel: [{"class": "play_button", "x": 1, "y": 2, "w": 3, "h": 4}] for rel in rels}
+
+    first = coco.build(root, labels)
+    again = coco.build(root, dict(reversed(list(labels.items()))))
+
+    assert again == first
+
+
+def test_main_prints_every_class_and_warns_on_thin_anchor_truth(tmp_path, capsys):
+    root = tmp_path / "play"
+    rels = _write_frames(root, ["alpha", "beta", "gamma"])
+    export = tmp_path / "export.json"
+    export.write_text(
+        json.dumps([_task(rel, [("play_button", 25, 25, 10, 10)]) for rel in rels]),
+        encoding="utf-8",
+    )
+
+    code = coco.main([str(export), "--root", str(root)])
+
+    out = capsys.readouterr().out
+    # A warning, never a refusal.
+    assert code == 0
+    assert "  play_button 6\n" in out
+    assert "  close_x 0\n" in out
+    summary = json.loads((root / "coco" / "split.json").read_text(encoding="utf-8"))
+    per_split = ", ".join(
+        f"{name} {summary['split_boxes'][name]['play_button']}" for name, _ in coco.SPLITS
+    )
+    assert f"  play_button: {per_split}\n" in out
+    for anchor in ("skull_star", "team_up_panel", "event_tab"):
+        assert f"  {anchor}: no label source\n" in out
+        assert f"WARNING: {anchor}" not in out
+    assert "WARNING: play_button has" in out
+    assert "WARNING: close_x has 0 truth boxes in valid and 0 in test" in out
+
+
+def test_main_does_not_warn_once_valid_and_test_hold_enough_truth(tmp_path, capsys):
+    root = tmp_path / "play"
+    # Two sources make a smoke layout, so valid and test each hold all 30 frames.
+    rels = _write_named(root, "alpha", [f"alpha-{n:06d}.jpg" for n in range(15)])
+    rels += _write_named(root, "beta", [f"beta-{n:06d}.jpg" for n in range(15)])
+    boxes = [(anchor, 25, 25, 10, 10) for anchor in sorted(coco.LABELLED_ANCHORS)]
+    export = tmp_path / "export.json"
+    export.write_text(json.dumps([_task(rel, boxes) for rel in rels]), encoding="utf-8")
+
+    assert coco.main([str(export), "--root", str(root)]) == 0
+
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_train_describe_lists_classes_with_no_boxes(capsys):
+    summary = {
+        "sources": {"alpha": "train"},
+        "smoke": False,
+        "frames": {"train": 1, "valid": 0, "test": 0},
+        "boxes": {"close_x": 0, "play_button": 3},
+        "training_set_hash": "0" * 64,
+    }
+
+    train.describe(summary)
+
+    out = capsys.readouterr().out
+    assert "  close_x 0\n" in out
+    assert "  play_button 3\n" in out

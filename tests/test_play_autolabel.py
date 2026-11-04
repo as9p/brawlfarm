@@ -115,6 +115,18 @@ def test_main_writes_a_task_per_frame_with_templates(tmp_path, monkeypatch):
     assert (tmp_path / "labelstudio" / "config.xml").is_file()
 
 
+def test_main_lists_classes_with_no_boxes(tmp_path, monkeypatch, capsys):
+    _dataset(tmp_path)
+    play = {"class": "play_button", "x": 700, "y": 700, "w": 200, "h": 100, "score": 0.9}
+    calls = iter([[play], []])
+    monkeypatch.setattr(prelabel, "boxes_for", lambda frame, **kw: next(calls))
+    monkeypatch.setattr(autolabel, "ocr_engine", lambda: _FakeOcr([]))
+    assert autolabel.main(["--root", str(tmp_path), "--no-sam"]) == 0
+    out = capsys.readouterr().out
+    assert "  play_button 1\n" in out
+    assert "  close_x 0\n" in out
+
+
 def test_main_hands_bars_to_the_sam_stage(tmp_path, monkeypatch):
     rels = _dataset(tmp_path, n=1)
     monkeypatch.setattr(prelabel, "boxes_for", lambda frame, **kw: [])
