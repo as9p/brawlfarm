@@ -27,7 +27,7 @@ index.jsonl                      one line per kept frame
 labelstudio/config.xml           the labelling interface
 labelstudio/tasks.json           the import file, with template pre-label boxes
 labelstudio/autolabel.json       the import file the auto-labeller writes, boxes as predictions
-autolabel/                       the auto-labeller's SAM work folder, only when SAM runs
+autolabel/                       the auto-labeller's work folder: checkpoint and SAM files
 exclusions.json                  per-source facecam rectangles the auto-labeller skips
 coco/{train,valid,test}/         the training set, split by source
 runs/<YYYYmmdd-HHMMSS>/          training output
@@ -163,8 +163,15 @@ for more), `--no-sam` skips the SAM pass and boxes every brawler with a fixed-si
 bar (quick and needs no GPU, but the boxes are looser), and `--model` picks another SAM
 checkpoint. On an RTX 4080 SUPER the SAM pass alone takes about 0.4 s a frame once the model has
 loaded. The first pass also runs OCR on the CPU, and about 0.9 s a frame overall was measured in
-the spike; a 6-frame run took 21 s including the model load. The SAM work folder `autolabel/` under the
-dataset root exists only when SAM ran.
+the spike; a 6-frame run took 21 s including the model load.
+
+A full run takes well over an hour, so it keeps its progress in the work folder `autolabel/`
+under the dataset root: the first pass appends every finished frame to `pass1.jsonl`, and the
+SAM pass appends every finished frame to `boxes.jsonl`. A stopped run is continued with
+`--resume` (plus the same `--root`, `--source` and other flags): finished frames are not done
+again, and the summary says how many came from the checkpoint and how many SAM frames were
+already done. Without `--resume` the run starts over and drops both files first. Checkpoint
+lines written by another auto-labeller version are redone, never mixed in.
 
 Nothing is labelled inside the HUD: the counters and player cards at the top left, the attack,
 super and gadget buttons at the bottom right, and the joystick corner. A box that falls mostly
