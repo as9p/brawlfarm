@@ -427,6 +427,20 @@ HOME_BUTTON = (1525, 47)  # calibrated on the brawler trophy screen (white house
 # WINS" banner that would false-match). Calibrated live on a farm account.
 DAILY_STREAK_TITLE_REGION = (380, 90, 1080, 270)  # banner band — OCR "STREAK" here
 DAILY_STREAK_CLAIM = (1331, 703)  # green CLAIM button
+# Not every variant has a CLAIM button (2026-11-04: the day-1 "It's time to Brawl!" popup
+# has none, and a blind tap on DAILY_STREAK_CLAIM hit empty background 1442 times). So the
+# handler verifies first: OCR "CLAIM" around the button, else the popup's own red ✕ (which
+# scored 0.853 on a capture, too close to the global 0.85 to trust, hence the local
+# threshold, accepted only in the top-right area so a weak match elsewhere is never
+# tapped), else one Android BACK.
+DAILY_STREAK_CLAIM_REGION = (1130, 620, 1530, 790)  # OCR "CLAIM" here (around the button)
+DAILY_STREAK_CLOSE_X_REGION = (1420, 100, 1600, 240)  # the ✕ centre must land in here
+DAILY_STREAK_CLOSE_X_THRESHOLD = 0.80  # local close_x threshold, this popup only
+
+# Repeat guard for the controller's UNKNOWN-path handlers (daily streak, team invite):
+# this many consecutive loop iterations taking the SAME handler branch escalate to
+# recover("<name>_stuck") instead of running the handler again.
+HANDLER_REPEAT_MAX = 4
 
 # --- Brawler selection -------------------------------------------------------
 # Open the BRAWLERS screen from the menu (left-side button), sort by "Least Trophies",
