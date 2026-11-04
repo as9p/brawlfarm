@@ -289,13 +289,40 @@ predictions instead of hand-made annotations, which is the normal route with the
 
     uv run python tools/play/coco.py <dataset root>/labelstudio/autolabel.json --from-predictions
 
-The split is by source video, never by frame: consecutive frames of one video look almost
-identical, so splitting by frame would put near-copies of the same picture on both sides of the
-split and make the score look better than the model really is. A source is assigned to a
-**split** (`train`, `valid` or `test`) by hashing its name, and train always keeps the largest
-split. With fewer than three sources there are not enough videos to split at all, so `coco.py`
-writes the same frames into all three splits and marks the layout as a smoke set; every later
-tool in this kit warns when it sees that mark.
+The split is by source, never by frame: consecutive frames of one video look almost identical,
+so splitting by frame would put near-copies of the same picture on both sides of the split and
+make the score look better than the model really is. Each frame gets a **split key**, and each
+key is assigned to a **split** (`train`, `valid` or `test`) by hashing it, so the same frames
+land in the same split on every run and adding sources later does not move the old ones. Train
+always keeps the largest split.
+
+A YouTube source (`yt-<video id>`) is one key: the whole video goes to one split. A recorder or
+capture session is one long sitting, and hashed whole it would put every frame it holds, and
+every tap anchor it shows, on one side, which leaves valid and test with no tap-anchor truth.
+So a session is cut into contiguous pieces, and each piece is its own key. A session frame whose
+file name carries a time, such as `20261104-063119-00133.jpg`, is keyed by its 5-minute window
+(`WINDOW_MINUTES` in `coco.py`). The key is `<session>@<window>`, for example
+`capture-20261104b@20261104-0630`. `frames.py` saves frames as `<source>-<number>.jpg`, which
+carries no time, but it numbers a session's frames upwards in the order they were captured. So a
+frame named that way is keyed by its block of 60 frames instead (`SESSION_BLOCK_FRAMES` in
+`coco.py`). The key is `<session>@b<block>`, the frame number divided by 60 and rounded down, so
+`capture-20261104-000123.jpg` is in `capture-20261104@b2`. Sixty frames is three minutes of a
+capture at one frame every 3 seconds: a 30-minute capture becomes ten keys and a 138-frame
+recorder session three. A time in the name always wins over a number, and the frames of one
+window or block always stay together. A recorder session is named after the second it started,
+and that stamp is never read as a frame's time. A frame whose name carries neither a time nor its
+source's frame number falls back to its whole source as the key.
+With fewer than three split keys there is not enough to split at all, so `coco.py` writes the
+same frames into all three splits and marks the layout as a smoke set; every later tool in this
+kit warns when it sees that mark.
+
+`coco.py` prints the box count of every class, zeros included, then the tap-anchor truth in each
+split; `split.json` keeps the same per-split counts under `split_boxes`. A threshold or a score
+drawn from a handful of boxes means nothing, so `coco.py` prints a WARNING for every tap anchor
+that has fewer than 30 truth boxes in `valid` or in `test`. No template finds `skull_star`,
+`team_up_panel` or `event_tab`, so they have no label source: they are listed as such and never
+warned about. The warnings do not stop the build. `autolabel.py` and `train.py` also list every
+class, zeros included.
 
 ## Step 7: train
 

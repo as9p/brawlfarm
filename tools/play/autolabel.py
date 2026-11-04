@@ -312,9 +312,9 @@ def main(argv: list[str] | None = None) -> int:
         f"{fixed} fixed brawler boxes"
     )
     print(f"{resumed} frames from the checkpoint, {sam_done} SAM frames already done")
+    # Every class, zeros included: a class the run never drew is the thing to notice.
     for cls in classes.CLASSES:
-        if per_class[cls]:
-            print(f"  {cls} {per_class[cls]}")
+        print(f"  {cls} {per_class[cls]}")
     print(f"wrote {path} and {out_dir / 'config.xml'}")
     print(f"next: uv run python tools/play/coco.py {path} --root {root} --from-predictions")
     return 0

@@ -3,8 +3,10 @@
 The split is by source video, never by frame: consecutive frames of one video look alike, so a
 frame-wise split would put near-copies on both sides of it and score a model on pictures it has
 already seen. A source is assigned by hashing its name, which keeps the split stable when more
-videos are added later. Frames with no boxes are kept: a detector needs to be shown the screens
-where there is nothing to find.
+videos are added later. A recorder or capture session is one long sitting, though, so it is
+cut into contiguous pieces instead: each window of WINDOW_MINUTES, or each block of
+SESSION_BLOCK_FRAMES frames when the frame names carry no time, is its own split key. Frames with
+no boxes are kept: a detector needs to be shown the screens where there is nothing to find.
 
     uv run python tools/play/coco.py export.json
     uv run python tools/play/coco.py export.json --root D:/play-data --from-predictions
@@ -15,8 +17,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -25,9 +29,78 @@ import numpy as np
 from tools.play import classes, dataset
 
 SPLITS = (("train", 0.8), ("valid", 0.1), ("test", 0.1))
-# Below this many sources a real split would leave a side empty, so the kit builds a smoke
+# Below this many split keys a real split would leave a side empty, so the kit builds a smoke
 # layout instead: the same frames in all three folders, good enough to prove the pipeline runs.
 SMOKE_MIN = 3
+# Hashed whole, a session puts every frame of it, and every rare tap anchor it shows, on one
+# side of the split, which leaves valid and test with no anchor truth at all. So a session frame
+# is keyed by the window of this many minutes its file name's time falls in.
+WINDOW_MINUTES = 5
+# frames.py saves a frame as `<source>-<number>.jpg`, with no time in the name, and numbers a
+# session's frames upwards in the order they were captured. Such a frame is keyed by its block of
+# this many frames instead. 60 frames is three minutes of a capture taken at one frame per 3 s,
+# so a 30-minute capture becomes ten keys and the 138-frame recorder session three: enough for
+# one sitting to reach valid and test, while each cut puts only the two frames that meet at it,
+# near-copies of each other, on different sides of the split.
+SESSION_BLOCK_FRAMES = 60
+# ingest_youtube.py names a video's source yt-<video id>; a video is always split whole.
+YOUTUBE_PREFIX = "yt-"
+# Joins a session to its window or block in a split key. A source name can never hold it.
+WINDOW_MARK = "@"
+STAMP_RE = re.compile(r"(?<!\d)(\d{8})-(\d{6})(?!\d)")
+# A tap anchor needs this many truth boxes in valid and in test before a threshold or a score
+# drawn from that split means anything.
+TRUTH_MIN = 30
+# The templates are the only label source for tap anchors. An anchor no template maps to has no
+# truth anywhere, so it is reported as having no label source rather than warned about.
+LABELLED_ANCHORS = classes.TAP_ANCHORS & frozenset(classes.TEMPLATE_CLASS.values())
+
+
+def _frame_time(source: str, file_name: str) -> datetime | None:
+    """The time in a frame's file name, or None when it carries none.
+
+    The source's own name is cut off first: a recorder session is named after the second it
+    started, and that stamp is the session's, not the frame's.
+    """
+    stem = Path(file_name).stem
+    if stem.startswith(f"{source}-"):
+        stem = stem[len(source) + 1 :]
+    match = STAMP_RE.search(stem)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime("".join(match.groups()), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+
+
+def _frame_number(source: str, file_name: str) -> int | None:
+    """The number in a frame name of the form frames.py saves, `<source>-<number>.jpg`, or None."""
+    match = re.fullmatch(rf"{re.escape(source)}-([0-9]+)\.jpg", Path(file_name).name)
+    return None if match is None else int(match.group(1))
+
+
+def split_key(source: str, file_name: str) -> str:
+    """What a frame is split by: its source, or `<session>@<window>` or `<session>@b<block>`.
+
+    A YouTube video stays whole. Any other source whose frame names carry a time is cut into
+    windows of WINDOW_MINUTES, each named after its first minute. A frame with no time in its
+    name but saved under a number by frames.py goes by its block of SESSION_BLOCK_FRAMES
+    instead, so a time in the name always wins over a number. Either way the frames of one
+    window or block always land together and a frame gets the same key every run. A frame with
+    neither falls back to its whole source.
+    """
+    if source.startswith(YOUTUBE_PREFIX):
+        return source
+    when = _frame_time(source, file_name)
+    if when is None:
+        number = _frame_number(source, file_name)
+        if number is None:
+            return source
+        return f"{source}{WINDOW_MARK}b{number // SESSION_BLOCK_FRAMES}"
+    minutes = when.hour * 60 + when.minute
+    start = minutes - minutes % WINDOW_MINUTES
+    return f"{source}{WINDOW_MARK}{when:%Y%m%d}-{start // 60:02d}{start % 60:02d}"
 
 
 def split_of(source: str) -> str:
@@ -174,14 +247,14 @@ def build(root: Path, labels: dict[str, list[dict]]) -> dict:
     entries = []
     for rel in sorted(labels):
         path, source = _source_of(root, rel)
-        entries.append((rel, path, source))
-    sources = sorted({source for _rel, _path, source in entries})
-    assigned = assign_splits(sources)
-    smoke = len(sources) < SMOKE_MIN
+        entries.append((rel, path, split_key(source, path.name)))
+    keys = sorted({key for _rel, _path, key in entries})
+    assigned = assign_splits(keys)
+    smoke = len(keys) < SMOKE_MIN
 
     per_split: dict[str, list[tuple[str, Path]]] = {name: [] for name, _ratio in SPLITS}
-    for rel, path, source in entries:
-        names = [name for name, _ratio in SPLITS] if smoke else [assigned[source]]
+    for rel, path, key in entries:
+        names = [name for name, _ratio in SPLITS] if smoke else [assigned[key]]
         for name in names:
             per_split[name].append((rel, path))
 
@@ -198,8 +271,13 @@ def build(root: Path, labels: dict[str, list[dict]]) -> dict:
     frames: dict[str, int] = {}
     # Counted over the labels, not the folders: a smoke layout writes each frame three times.
     boxes: Counter[str] = Counter(
-        box["class"] for rel, _path, _source in entries for box in labels[rel]
+        box["class"] for rel, _path, _key in entries for box in labels[rel]
     )
+    # Counted over each folder, so a smoke layout shows the same truth on every side, as it is.
+    split_boxes = {
+        name: Counter(box["class"] for rel, _path in per_split[name] for box in labels[rel])
+        for name, _ratio in SPLITS
+    }
     for name, _ratio in SPLITS:
         folder = coco / name
         folder.mkdir(parents=True, exist_ok=True)
@@ -244,6 +322,10 @@ def build(root: Path, labels: dict[str, list[dict]]) -> dict:
         "smoke": smoke,
         "frames": frames,
         "boxes": {cls: boxes[cls] for cls in classes.CLASSES},
+        "split_boxes": {
+            name: {cls: split_boxes[name][cls] for cls in classes.CLASSES}
+            for name, _ratio in SPLITS
+        },
         "training_set_hash": hashlib.sha256("\n".join(lines).encode()).hexdigest(),
     }
     (coco / "split.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
@@ -272,14 +354,50 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = build(root, labels)
     counts = ", ".join(f"{name} {summary['frames'][name]}" for name, _ratio in SPLITS)
-    print(f"{len(labels)} frames from {len(summary['sources'])} sources: {counts}")
+    sources = {key.split(WINDOW_MARK, 1)[0] for key in summary["sources"]}
+    print(
+        f"{len(labels)} frames from {len(sources)} sources in {len(summary['sources'])} "
+        f"split keys: {counts}"
+    )
     if summary["smoke"]:
         print("smoke layout: the same frames are in all three splits")
+    # Every class, zeros included: a class with no boxes is the thing to notice.
     for cls in classes.CLASSES:
-        if summary["boxes"][cls]:
-            print(f"  {cls} {summary['boxes'][cls]}")
+        print(f"  {cls} {summary['boxes'][cls]}")
     print(f"training set hash {summary['training_set_hash'][:16]}")
+    report_anchor_truth(summary)
     return 0
+
+
+def report_anchor_truth(summary: dict) -> None:
+    """Print each tap anchor's truth per split, and warn loudly where valid or test is thin.
+
+    Only a warning: the build is already written, and a thin split is a reason to collect more
+    frames, not to throw away the ones there are.
+    """
+    per_split = summary["split_boxes"]
+    anchors = [cls for cls in classes.CLASSES if cls in classes.TAP_ANCHORS]
+    thin = []
+    print("tap-anchor truth per split:")
+    for cls in anchors:
+        if cls not in LABELLED_ANCHORS:
+            print(f"  {cls}: no label source")
+            continue
+        print(f"  {cls}: " + ", ".join(f"{name} {per_split[name][cls]}" for name, _ in SPLITS))
+        valid, test = per_split["valid"][cls], per_split["test"][cls]
+        if min(valid, test) < TRUTH_MIN:
+            thin.append((cls, valid, test))
+    if not thin:
+        return
+    print("")
+    for cls, valid, test in thin:
+        print(
+            f"WARNING: {cls} has {valid} truth boxes in valid and {test} in test, "
+            f"fewer than {TRUTH_MIN}"
+        )
+    print("WARNING: a threshold or a score drawn from so few boxes means nothing, so the model")
+    print("WARNING: is not proven on these anchors. Collect more frames that show them.")
+    print("")
 
 
 if __name__ == "__main__":
