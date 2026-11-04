@@ -289,19 +289,49 @@ predictions instead of hand-made annotations, which is the normal route with the
 
     uv run python tools/play/coco.py <dataset root>/labelstudio/autolabel.json --from-predictions
 
-The split is by source video, never by frame: consecutive frames of one video look almost
-identical, so splitting by frame would put near-copies of the same picture on both sides of the
-split and make the score look better than the model really is. A source is assigned to a
-**split** (`train`, `valid` or `test`) by hashing its name, and train always keeps the largest
-split. With fewer than three sources there are not enough videos to split at all, so `coco.py`
-writes the same frames into all three splits and marks the layout as a smoke set; every later
-tool in this kit warns when it sees that mark.
+The split is by source, never by frame: consecutive frames of one video look almost identical,
+so splitting by frame would put near-copies of the same picture on both sides of the split and
+make the score look better than the model really is. Each frame gets a **split key**, and each
+key is assigned to a **split** (`train`, `valid` or `test`) by hashing it, so the same frames
+land in the same split on every run and adding sources later does not move the old ones. Train
+always keeps the largest split.
+
+A YouTube source (`yt-<video id>`) is one key: the whole video goes to one split. A recorder or
+capture session is one long sitting, and hashed whole it would put every frame it holds, and
+every tap anchor it shows, on one side, which leaves valid and test with no tap-anchor truth.
+So a session is cut into contiguous pieces, and each piece is its own key. A session frame whose
+file name carries a time, such as `20261104-063119-00133.jpg`, is keyed by its 5-minute window
+(`WINDOW_MINUTES` in `coco.py`). The key is `<session>@<window>`, for example
+`capture-20261104b@20261104-0630`. `frames.py` saves frames as `<source>-<number>.jpg`, which
+carries no time, but it numbers a session's frames upwards in the order they were captured. So a
+frame named that way is keyed by its block of 60 frames instead (`SESSION_BLOCK_FRAMES` in
+`coco.py`). The key is `<session>@b<block>`, the frame number divided by 60 and rounded down, so
+`capture-20261104-000123.jpg` is in `capture-20261104@b2`. Sixty frames is three minutes of a
+capture at one frame every 3 seconds: a 30-minute capture becomes ten keys and a 138-frame
+recorder session three. A time in the name always wins over a number, and the frames of one
+window or block always stay together. A recorder session is named after the second it started,
+and that stamp is never read as a frame's time. A frame whose name carries neither a time nor its
+source's frame number falls back to its whole source as the key.
+With fewer than three split keys there is not enough to split at all, so `coco.py` writes the
+same frames into all three splits and marks the layout as a smoke set; every later tool in this
+kit warns when it sees that mark.
+
+`coco.py` prints the box count of every class, zeros included, then the tap-anchor truth in each
+split; `split.json` keeps the same per-split counts under `split_boxes`. A threshold or a score
+drawn from a handful of boxes means nothing, so `coco.py` prints a WARNING for every tap anchor
+that has fewer than 30 truth boxes in `valid` or in `test`. No template finds `skull_star`,
+`team_up_panel` or `event_tab`, so they have no label source: they are listed as such and never
+warned about. The warnings do not stop the build. `autolabel.py` and `train.py` also list every
+class, zeros included.
 
 ## Step 7: train
 
 `train.py` is a self-contained script: `uv run tools/play/train.py` builds its own environment
 on first run, including torch from the CUDA 12.8 index, about 3 GB. It never touches the
-project's own `pyproject.toml` or lock file.
+project's own `pyproject.toml` or lock file. To train on the GPU you need an NVIDIA GPU with a
+display driver new enough for CUDA 12.8 (the CUDA runtime comes inside that torch build), and the
+script must be started with `uv run` as below, since a torch from any other environment may be a
+CPU-only build.
 
 ```
 uv run tools/play/train.py
@@ -313,6 +343,19 @@ more than the 8 used for a smoke test), `--batch` the number of images per train
 `--accum` the number of steps to accumulate gradients over before updating the model, which
 lets a small GPU behave like a bigger one. On an RTX 4080 SUPER, 8 epochs on a tiny set took
 about 50 seconds; a real run takes much longer. Output goes to `runs/<YYYYmmdd-HHMMSS>/`.
+Right before training starts, `train.py` prints the device it will train on, `cuda` with the
+GPU name or `cpu` with a loud warning, because a CPU run is very slow and can take hours.
+
+Tap anchors (the buttons, cards and panels the controller taps) are rare in the frames, so
+training **oversamples** them: every training image that holds at least one tap-anchor box goes
+into the training data four times instead of once. `--anchor-repeat` sets how many times, as a
+whole number of 1 or more, and `--anchor-repeat 1` turns it off. The repeats are written as
+annotation files in `runs/<YYYYmmdd-HHMMSS>/feed/` that point at the frames in `coco/`, so no
+frame is copied, and the run trains on that folder instead of `coco/`. Only the training split
+is oversampled: the validation and test images still go in once each, so the thresholds export
+picks and the score are measured on images counted once. Training prints how many images it
+repeated. When no training image holds a tap anchor, or the flag is 1, it trains on `coco/`
+directly.
 
 ## Step 8: export
 
@@ -340,25 +383,58 @@ no validation images, or one that never reaches its target, gets 0.95, the most 
 threshold available. Thresholds, the target each class was held to and the run they came from
 are written to `play.json` next to `play.onnx`.
 
+Next to each threshold, `play.json` records how many validation boxes of that class there were
+(`truth`) and whether the threshold is **certified** (`certified`). A threshold is certified
+only when there were at least 30 validation boxes of its class and it really reached its
+precision target. With fewer boxes, one box moves the precision too far to trust it, and the
+0.95 fallback is never certified, however many boxes there were. Export prints every class that
+is not certified, with the reason. An uncertified threshold is still written and the detector
+still loads it: it means the model is not proven on that class yet, and the fix is more frames
+that show it. 30 is the same number `coco.py` warns about when a tap anchor has too few boxes in
+the validation or test split.
+
 ## Step 9: score
 
 ```
 uv run python tools/play/score.py
 ```
 
-`--root` picks the dataset root, `--models` the folder holding `play.onnx` (default
-`models/`), `--frames` adds a folder of pictures to score besides the dataset root's own frames
-(repeat the flag for more), and `--cuda` asks for the CUDA execution provider.
+`score.py` runs the exported model over the **held-out test split**, the frames `coco.py` put
+in `coco/test/` and training never saw, and compares what it finds with the farm's own
+templates on every 1600 x 900 frame there. It trusts that split only when `coco/split.json`
+carries the same training set hash as `play.json`, since a build made after training can have
+moved training frames into the test folder. The report is written to `score.json` next to
+`play.onnx` and ends in one of three verdicts, which is also the exit code:
 
-`score.py` compares the exported model against the farm's own templates on every 1600 x 900
-frame it can find. The bar is not an average score: it is that the model never produces a
-**false positive** (a detection that should not be there) on a tap anchor, a class the farm
-would act on, because a tap on the wrong pixel can spend gems or leave a match queue. A single
-extra detection next to a correct one still fails the whole report. Missing a control the
-template found is only logged, not failed, because a miss just means a slower loop rather than
-a wrong tap. A run that scores no frames at all also fails, since a silent zero is not a pass.
-Three tap anchors have no template behind them (`skull_star`, `team_up_panel`, `event_tab`);
-those are listed separately as unverified and do not count toward the bar either way.
+- **PASS** (exit code 0): every tap anchor with a template behind it was measured and found
+  often enough, and none was detected where the templates see none.
+- **FAIL** (exit code 1): the model produced a **false positive** (a detection that should not
+  be there) on a tap anchor, a class the farm would act on, because a tap on the wrong pixel
+  can spend gems or leave a match queue. A single extra detection next to a correct one counts.
+  A tap anchor with at least `--min-truth` template boxes also fails when its **recall** (the
+  fraction of those boxes the model found too) is under `--min-recall`.
+- **INCONCLUSIVE** (exit code 2): nothing in the run proves the model safe. That is the verdict
+  when a tap anchor with a template has fewer than `--min-truth` template boxes in the scored
+  frames, when no frame was scored, when there is no COCO build, when the model was trained on
+  a smoke set, and for every folder scan.
+
+A FAIL wins over an INCONCLUSIVE, because a false positive is real wherever it was seen. For
+each tap anchor, `score.json` lists its truth (the template boxes in the scored frames), true
+positives, misses, false positives and recall, plus the reasons the verdict is not PASS, and
+the same reasons are printed under the verdict. Three tap anchors have no template behind them
+(`skull_star`, `team_up_panel`, `event_tab`): they are listed as having no label source, any
+detection of one is listed as unverified for you to check by hand, and they never change the
+verdict.
+
+`--root` picks the dataset root and `--models` the folder holding `play.onnx` (default
+`models/`). `--min-truth` is how many template boxes a tap anchor needs before its recall
+counts (default 30), and `--min-recall` is the recall it must then reach (default 0.5).
+`--cuda` runs the model on the CUDA execution provider; if onnxruntime cannot give it, the run
+stops with an error instead of quietly using the CPU, and the fix is the `play-gpu` extra
+described in [install.md](install.md). `--scan-folders` scores every picture under the dataset
+root's own frames and the calibration recordings instead of the test split, and `--frames`
+scans a folder you name instead (repeat the flag for more). Those folders hold training frames
+too, so a scan is only for looking at footage and always ends INCONCLUSIVE.
 
 ## How the first model ships
 

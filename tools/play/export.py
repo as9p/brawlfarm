@@ -26,6 +26,10 @@ lowest threshold that still buys its precision target on the validation set, and
 are models/play.onnx and models/play.json written. A tap anchor's target is always
 thresholds.MIN_PRECISION; every other class gets --min-precision-other, which defaults to
 thresholds.MIN_PRECISION_OTHER.
+
+play.json also records, per class, how many validation truth boxes the threshold was drawn from
+and whether it is certified: at least thresholds.MIN_TRUTH of them, and a threshold that really
+reached its target rather than the 0.95 fallback. Every class that is not certified is printed.
 """
 
 from __future__ import annotations
@@ -165,26 +169,59 @@ def pick_thresholds(
     truth_counts: dict[int, int],
     min_precision_other: float,
 ) -> tuple[dict[str, float], dict[str, dict]]:
-    """Every class's threshold, and the validation numbers play.json records next to it."""
+    """Every class's threshold, and the validation numbers play.json records next to it.
+
+    A threshold is certified only when the validation split held at least thresholds.MIN_TRUTH
+    truth boxes of its class and the threshold really reached its precision target. The CEILING
+    that thresholds.pick falls back to when no threshold does is still written, so the class
+    stays effectively off, but it is never certified, however many boxes there were. Every class
+    that is not certified is printed with its reasons.
+    """
     picked: dict[str, float] = {}
     validation: dict[str, dict] = {}
+    uncertified: list[tuple[str, list[str]]] = []
     for index, name in enumerate(names):
         target = thresholds.target_for(name, other=min_precision_other)
         threshold = thresholds.pick(scores[index], hits[index], min_precision=target)
         above = [
             hit for score, hit in zip(scores[index], hits[index], strict=True) if score >= threshold
         ]
+        truth = truth_counts[index]
+        reasons = []
+        if truth < thresholds.MIN_TRUTH:
+            reasons.append(f"{truth} validation truth boxes, fewer than {thresholds.MIN_TRUTH}")
+        # the same test pick ran: nothing above the threshold reached the target, so it fell back
+        if not above or sum(above) / len(above) < target:
+            reasons.append(
+                f"{threshold:.2f} is the fallback, no threshold reached its {target:.2f} "
+                "precision target"
+            )
         picked[name] = threshold
         validation[name] = {
-            "truth": truth_counts[index],
+            "truth": truth,
+            "certified": not reasons,
             "detections": len(above),
             "precision_at_threshold": round(sum(above) / len(above), 4) if above else 0.0,
             "min_precision": target,
         }
+        if reasons:
+            uncertified.append((name, reasons))
         print(
             f"  {name} threshold {threshold:.2f} target {target:.2f} "
-            f"truth {truth_counts[index]} detections {len(above)}"
+            f"truth {truth} detections {len(above)}"
         )
+    if uncertified:
+        print("")
+        for name, reasons in uncertified:
+            print(f"WARNING: {name} is not certified: {'; '.join(reasons)}")
+        print(
+            "WARNING: an uncertified threshold is a guess, not a measurement, so the model is not"
+        )
+        print(
+            "WARNING: proven on those classes; play.json records them as certified false. Collect"
+        )
+        print("WARNING: more frames that show them.")
+        print("")
     return picked, validation
 
 

@@ -21,6 +21,11 @@ Run it from the repository root and it resolves everything else itself:
 It refuses to start without coco/split.json, because a training run with no recorded split is
 a model nobody can score later. num_workers is 0 on purpose: the dataloader's worker processes
 deadlock on Windows.
+
+Train images that show a tap anchor are rare, so each one goes into the training feed
+--anchor-repeat times (4 by default; 1 turns it off). The feed is the COCO build's annotation
+files rewritten into the run folder, run/feed, with the extra copies in train only: valid and
+test go in once, and no frame is copied.
 """
 
 from __future__ import annotations
@@ -29,8 +34,18 @@ import argparse
 import json
 import os
 import sys
+from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tools.play import classes  # noqa: E402
+
+ANNOTATIONS = "_annotations.coco.json"
+SPLITS = ("train", "valid", "test")
+# how many times a train image that shows a tap anchor goes into the training feed
+ANCHOR_REPEAT = 4
 
 
 def default_root() -> Path:
@@ -45,16 +60,113 @@ def default_root() -> Path:
 def describe(summary: dict) -> None:
     """Print what is about to be trained on, loudly enough that a smoke set is not mistaken."""
     counts = ", ".join(f"{name} {count}" for name, count in sorted(summary["frames"].items()))
-    print(f"{len(summary['sources'])} sources: {counts}")
+    print(f"{len(summary['sources'])} split keys: {counts}")
+    # Every class, zeros included: a class with no boxes trains nothing and should be seen.
     for name, count in sorted(summary["boxes"].items()):
-        if count:
-            print(f"  {name} {count}")
+        print(f"  {name} {count}")
     print(f"training set hash {summary['training_set_hash'][:16]}")
     if summary["smoke"]:
         print("")
         print("WARNING: this is a smoke set. The same frames are in all three splits, so the")
         print("WARNING: validation score is meaningless and the model must not ship.")
         print("")
+
+
+def describe_device() -> None:
+    """Print the device rfdetr will train on, and shout when it is the CPU: a CPU run takes hours.
+
+    This only reports. rfdetr still picks the device itself, and like this check it prefers CUDA,
+    then Apple's MPS, then the CPU.
+    """
+    try:
+        import torch  # here, like rfdetr, so the tests run without torch
+    except ImportError:
+        print("training device unknown: torch does not import")
+        return
+    if torch.cuda.is_available():
+        print(f"training device cuda ({torch.cuda.get_device_name()})")
+        return
+    # an older torch has no backends.mps at all
+    mps = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps is not None and mps.is_available():
+        print("training device mps")
+        return
+    print("training device cpu")
+    print("")
+    print("WARNING: torch sees no CUDA GPU, so this run trains on the CPU.")
+    print("WARNING: CPU training is very slow: a 60-epoch run can take many hours.")
+    print("WARNING: To train on the GPU, torch must be a CUDA build and the NVIDIA display driver")
+    print("WARNING: must be new enough for CUDA 12.8. Start it as `uv run tools/play/train.py`:")
+    print("WARNING: its inline metadata gives it its own environment with torch from the CUDA")
+    print("WARNING: 12.8 index. A torch from any other environment may be a CPU-only build.")
+    print("WARNING: See docs/play-training.md, Step 7: train, then run this again.")
+    print("")
+
+
+def repeat_count(text: str) -> int:
+    """An argparse type for --anchor-repeat: a whole number, 1 or more."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{value} is below 1")
+    return value
+
+
+def build_feed(coco: Path, feed: Path, repeat: int) -> int:
+    """Write the training feed into feed, and return how many train images hold a tap anchor.
+
+    Each train image that holds at least one tap-anchor box goes in `repeat` times. Every copy
+    is a COCO image of its own, with a fresh image id and fresh box ids: rfdetr's dataset is one
+    sample per image id, so a copy that kept its original's id would collapse back into it and
+    train nothing. valid and test are written as they are and never repeated, so a threshold or
+    a score is still drawn from frames counted once. No frame is copied: each file_name becomes
+    the frame's absolute path in the COCO build, and rfdetr opens `Path(split folder) /
+    file_name`, a join that an absolute path wins.
+
+    Nothing is written when repeat is 1 or no train image holds a tap anchor; the caller then
+    trains on the COCO build itself.
+    """
+    if repeat < 2 or not (coco / "train" / ANNOTATIONS).is_file():
+        return 0
+    docs = {
+        split: json.loads((coco / split / ANNOTATIONS).read_text(encoding="utf-8"))
+        for split in SPLITS
+        if (coco / split / ANNOTATIONS).is_file()
+    }
+    train = docs["train"]
+    names = {category["id"]: category["name"] for category in train["categories"]}
+    anchored = {
+        box["image_id"]
+        for box in train["annotations"]
+        if names[box["category_id"]] in classes.TAP_ANCHORS
+    }
+    if not anchored:
+        return 0
+
+    for split, doc in docs.items():
+        folder = (coco / split).absolute()
+        for image in doc["images"]:
+            image["file_name"] = str(folder / image["file_name"])
+    boxes: dict[int, list[dict]] = defaultdict(list)
+    for box in train["annotations"]:
+        boxes[box["image_id"]].append(box)
+    originals = [image for image in train["images"] if image["id"] in anchored]
+    next_image = max(image["id"] for image in train["images"]) + 1
+    next_box = max(box["id"] for box in train["annotations"]) + 1
+    for _ in range(repeat - 1):
+        for image in originals:
+            train["images"].append({**image, "id": next_image})
+            for box in boxes[image["id"]]:
+                train["annotations"].append({**box, "id": next_box, "image_id": next_image})
+                next_box += 1
+            next_image += 1
+
+    for split, doc in docs.items():
+        (feed / split).mkdir(parents=True, exist_ok=True)
+        (feed / split / ANNOTATIONS).write_text(json.dumps(doc), encoding="utf-8")
+    return len(anchored)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,6 +178,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--accum", type=int, default=2, help="gradient accumulation steps")
+    ap.add_argument(
+        "--anchor-repeat",
+        type=repeat_count,
+        default=ANCHOR_REPEAT,
+        help="how many times each train image with a tap anchor goes into the training feed "
+        f"(default {ANCHOR_REPEAT}); 1 turns it off",
+    )
     args = ap.parse_args(argv)
 
     root = args.root if args.root is not None else default_root()
@@ -79,10 +198,25 @@ def main(argv: list[str] | None = None) -> int:
     run.mkdir(parents=True, exist_ok=True)
     print(f"training into {run}")
 
+    dataset = root / "coco"
+    repeated = build_feed(dataset, run / "feed", args.anchor_repeat)
+    if args.anchor_repeat == 1:
+        print("anchor oversampling is off: every train image goes in once")
+    elif repeated:
+        held = "image holds" if repeated == 1 else "images hold"
+        print(
+            f"{repeated} train {held} a tap anchor, each in the training feed "
+            f"{args.anchor_repeat} times: {repeated * (args.anchor_repeat - 1)} extra samples"
+        )
+        dataset = run / "feed"
+    else:
+        print("no train image holds a tap anchor: nothing to oversample")
+
     from rfdetr import RFDETRNano  # here, so a missing split fails before torch loads
 
+    describe_device()
     RFDETRNano().train(
-        dataset_dir=str(root / "coco"),
+        dataset_dir=str(dataset),
         epochs=args.epochs,
         batch_size=args.batch,
         grad_accum_steps=args.accum,
