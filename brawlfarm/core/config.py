@@ -452,6 +452,14 @@ DAILY_STREAK_CLAIM_REGION = (1130, 620, 1530, 790)  # OCR "CLAIM" here (around t
 DAILY_STREAK_CLOSE_X_REGION = (1420, 100, 1600, 240)  # the ✕ centre must land in here
 DAILY_STREAK_CLOSE_X_THRESHOLD = 0.80  # local close_x threshold, this popup only
 
+# Forced shooting gallery (live on Pie64, 1600x900, 2026-11-05): a launch opened a fullscreen
+# gallery with two "TAP!" prompts on cannons. Its EXIT sign is dead while the screen is up
+# (pixel diff 0.0 after a tap). About 10 taps on the cannons cleared it: a purple beam fired,
+# a gem shard dropped, and it did not return on the next launch. See states.is_forced_gallery.
+GALLERY_CANNON_LEFT = (200, 620)
+GALLERY_CANNON_RIGHT = (1400, 620)
+GALLERY_MAX_ROUNDS = 30  # cannon taps per session, three times the live count, then fall through
+
 # Repeat guard for the controller's UNKNOWN-path handlers (daily streak, team invite):
 # this many consecutive loop iterations taking the SAME handler branch escalate to
 # recover("<name>_stuck") instead of running the handler again.
