@@ -28,8 +28,8 @@ CUBE_GREEN = (60, 230, 70)
 BAR = (755, 350)
 
 
-def blank() -> np.ndarray:
-    return np.full((reader.FRAME_H, reader.FRAME_W, 3), FLOOR, dtype=np.uint8)
+def blank(floor: tuple[int, ...] = FLOOR) -> np.ndarray:
+    return np.full((reader.FRAME_H, reader.FRAME_W, 3), floor, dtype=np.uint8)
 
 
 def paint(frame: np.ndarray, x: int, y: int, mask: np.ndarray, colour: tuple[int, ...]) -> None:
@@ -80,9 +80,10 @@ def self_unit(
     colour: tuple[int, ...] = GREEN,
     ammo: float = 3,
     strip: bool = True,
+    tall: int = 17,
 ) -> None:
     x, y = bar
-    w, t = reader.BAR_W, 17
+    w, t = reader.BAR_W, tall
     frame[y - 2 : y + t + 2, x - 2 : x + w + 2] = BLACK
     frame[y : y + t, x : x + w] = NAVY
     frame[y : y + t, x : x + round(w * fill)] = colour
@@ -127,6 +128,13 @@ def enemy(frame: np.ndarray, x: int, y: int, value: int, colour: tuple[int, ...]
     text(frame, value, x + w // 2, y - 8, 13, WHITE)
 
 
+def hud() -> np.ndarray:
+    frame = blank()
+    teams(frame)
+    self_unit(frame)
+    return frame
+
+
 @pytest.mark.parametrize("value", [1, 2, 3, 4])
 def test_teams_left_reads_every_digit(value: int) -> None:
     frame = blank()
@@ -147,15 +155,31 @@ def test_a_digit_with_no_label_is_none() -> None:
     assert reader.read(frame).teams_left is None
 
 
-def test_an_empty_frame_reads_nothing() -> None:
-    r = reader.read(blank())
+@pytest.mark.parametrize("floor", [FLOOR, GREEN, RED, NAVY, RELOAD])
+def test_an_empty_frame_reads_nothing(floor: tuple[int, ...]) -> None:
+    r = reader.read(blank(floor))
     assert r == reader.Reading()
     assert all(v is None for k, v in dataclasses.asdict(r).items() if k != "enemy_health")
     assert r.enemy_health == ()
 
 
 def test_a_frame_of_any_other_size_reads_nothing() -> None:
-    frame = cv2.resize(blank(), (1280, 720))
+    # The HUD stays at its own coordinates, so only the size guard can refuse these.
+    frame = hud()
+    assert reader.read(frame).teams_left == 3
+    assert reader.read(frame[:800, :1500]) == reader.Reading()
+    assert reader.read(np.pad(frame, ((0, 100), (0, 100), (0, 0)))) == reader.Reading()
+
+
+def test_a_grayscale_frame_of_the_right_size_reads_nothing() -> None:
+    frame = cv2.cvtColor(hud(), cv2.COLOR_BGR2GRAY)
+    assert frame.shape == (reader.FRAME_H, reader.FRAME_W)
+    assert reader.read(frame) == reader.Reading()
+
+
+def test_a_bgra_frame_of_the_right_size_reads_nothing() -> None:
+    frame = cv2.cvtColor(hud(), cv2.COLOR_BGR2BGRA)
+    assert frame.shape == (reader.FRAME_H, reader.FRAME_W, 4)
     assert reader.read(frame) == reader.Reading()
 
 
@@ -248,9 +272,20 @@ def test_ammo_counts_loaded_segments_only(ammo: float, seen: int) -> None:
     assert reader.read(frame).self_ammo == seen
 
 
-def test_a_hidden_strip_is_no_ammo_reading() -> None:
-    frame = blank()
+@pytest.mark.parametrize("floor", [FLOOR, RELOAD])
+def test_a_hidden_strip_is_no_ammo_reading(floor: tuple[int, ...]) -> None:
+    # RELOAD is a floor the track mask matches, so the segments alone would read as empty.
+    frame = blank(floor)
     self_unit(frame, strip=False)
+    r = reader.read(frame)
+    assert r.self_health == 5400
+    assert r.self_ammo is None
+
+
+def test_a_covered_segment_is_no_ammo_reading() -> None:
+    frame = blank()
+    self_unit(frame)
+    frame[BAR[1] + 22 : BAR[1] + 31, BAR[0] + 64 : BAR[0] + 79] = (200, 30, 200)
     r = reader.read(frame)
     assert r.self_health == 5400
     assert r.self_ammo is None
@@ -285,16 +320,35 @@ def test_enemy_numbers_read_on_their_bars() -> None:
     assert reader.read(frame).enemy_health == (8351, 4480)
 
 
-def test_a_teammate_bar_is_not_an_enemy() -> None:
+@pytest.mark.parametrize(("second", "row"), [(1100, 500), (400, 300)])
+def test_two_enemies_at_equal_health_both_count(second: int, row: int) -> None:
     frame = blank()
-    enemy(frame, 300, 300, 5040, CYAN)
+    enemy(frame, 300, 300, 3200)
+    enemy(frame, second, row, 3200, YELLOW)
+    assert reader.read(frame).enemy_health == (3200, 3200)
+
+
+def test_one_enemy_on_a_split_bar_counts_once() -> None:
+    frame = blank()
+    enemy(frame, 300, 300, 835)
+    frame[300:312, 316:318] = BLACK
+    assert reader.read(frame).enemy_health == (835,)
+
+
+@pytest.mark.parametrize("colour", [CYAN, GREEN])
+def test_a_teammate_bar_is_not_an_enemy(colour: tuple[int, ...]) -> None:
+    frame = blank()
+    enemy(frame, 300, 300, 5040, colour)
     assert reader.read(frame).enemy_health == ()
 
 
 def test_the_self_bar_is_not_an_enemy() -> None:
     frame = blank()
-    self_unit(frame, fill=0.4, colour=RED, health=2500)
-    assert reader.read(frame).enemy_health == ()
+    # Short enough to pass the size check for another player's bar, so only the skip refuses it.
+    self_unit(frame, fill=0.4, colour=RED, health=2500, tall=14)
+    r = reader.read(frame)
+    assert r.self_health == 2500
+    assert r.enemy_health == ()
 
 
 def test_teammates_alive_has_no_source() -> None:

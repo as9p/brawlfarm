@@ -466,20 +466,25 @@ def _enemies(frame: np.ndarray, masks: _Masks, skip: _Anchor | None) -> tuple[in
         x, y = x + x0, y + y0
         if skip is not None and -8 <= x - skip.x <= BAR_W and -8 <= y - skip.y <= 40:
             continue
-        bars.append((x, y))
+        bars.append((x, y, w))
     out: list[int] = []
-    for x, y in sorted(bars):
+    read_bars: list[tuple[int, int]] = []
+    for x, y, w in sorted(bars):
+        # Pieces of one split bar reach the same number: same row, and together one bar wide.
+        if any(abs(y - ry) < OTHER_H[0] and x + w - rx <= OTHER_W[1] for rx, ry in read_bars):
+            continue
         value = _number(
             frame, x - 6, x + OTHER_W[1] + 6, y + OTHER_BAND[0], y + OTHER_BAND[1], None
         )
-        if value is not None and value not in out:
+        if value is not None:
             out.append(value)
+            read_bars.append((x, y))
     return tuple(out)
 
 
 def read(frame: np.ndarray, boxes: Sequence[Box] = ()) -> Reading:
     """Read one BGR frame. ``boxes`` is the detector's output for it, which may be empty."""
-    if frame.shape[:2] != (FRAME_H, FRAME_W):
+    if frame.shape != (FRAME_H, FRAME_W, 3):
         return Reading()
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     masks = _masks(hsv)
