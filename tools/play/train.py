@@ -17,6 +17,8 @@ Run it from the repository root and it resolves everything else itself:
 
     uv run tools/play/train.py
     uv run tools/play/train.py --root D:/play-data --epochs 80 --batch 4 --accum 4
+    uv run tools/play/train.py --resume
+    uv run tools/play/train.py --resume D:/play-data/runs/20260918-101112/checkpoint_29.ckpt
 
 It refuses to start without coco/split.json, because a training run with no recorded split is
 a model nobody can score later. num_workers is 0 on purpose: the dataloader's worker processes
@@ -26,6 +28,12 @@ Train images that show a tap anchor are rare, so each one goes into the training
 --anchor-repeat times (4 by default; 1 turns it off). The feed is the COCO build's annotation
 files rewritten into the run folder, run/feed, with the extra copies in train only: valid and
 test go in once, and no frame is copied.
+
+A full checkpoint is kept every --checkpoint-interval epochs (2 by default; rfdetr's own default
+is 10). --resume carries a crashed run on from one of them, in that checkpoint's run folder and on
+that run's training feed, so --anchor-repeat has no effect on it. With no path it takes the newest
+run that holds a checkpoint, and the newest checkpoint there that loads. Pass the --epochs, --batch
+and --accum the run started with: the checkpoint does not set them.
 """
 
 from __future__ import annotations
@@ -33,8 +41,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -46,6 +56,10 @@ ANNOTATIONS = "_annotations.coco.json"
 SPLITS = ("train", "valid", "test")
 # how many times a train image that shows a tap anchor goes into the training feed
 ANCHOR_REPEAT = 4
+# epochs between the full checkpoints a run keeps
+CHECKPOINT_INTERVAL = 2
+# rfdetr's name for those checkpoints; the number is the epoch that finished, counted from 0
+NUMBERED_CHECKPOINT = re.compile(r"checkpoint_(\d+)\.ckpt")
 
 
 def default_root() -> Path:
@@ -104,7 +118,7 @@ def describe_device() -> None:
 
 
 def repeat_count(text: str) -> int:
-    """An argparse type for --anchor-repeat: a whole number, 1 or more."""
+    """An argparse type for --anchor-repeat and --checkpoint-interval: a whole number, 1 or more."""
     try:
         value = int(text)
     except ValueError:
@@ -169,6 +183,93 @@ def build_feed(coco: Path, feed: Path, repeat: int) -> int:
     return len(anchored)
 
 
+def load_checkpoint(path: Path) -> dict:
+    """Load a whole checkpoint: nothing short of that proves the file is good."""
+    import torch  # here, like rfdetr, so the tests run without torch
+
+    # weights_only refuses a Lightning checkpoint, which holds more than tensors
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def newest_checkpoint_run(runs: Path) -> Path | None:
+    """The last run folder by name that holds a checkpoint; the name is a UTC stamp.
+
+    A crash before the first checkpoint leaves a newer folder with nothing to resume in it.
+    """
+    if not runs.is_dir():
+        return None
+    folders = sorted((folder for folder in runs.iterdir() if folder.is_dir()), reverse=True)
+    return next((folder for folder in folders if any(folder.glob("*.ckpt"))), None)
+
+
+def checkpoints_newest_first(run: Path) -> list[Path]:
+    """Every full checkpoint in run, newest first.
+
+    A numbered file sorts by the epoch in its name, which a copy of the folder cannot change.
+    last.ckpt has no number, so it goes ahead of the first numbered file no newer than it. rfdetr
+    rewrites it every epoch, so that is normally first, up to an interval ahead of the numbered
+    files; if a crash damaged it, the load fails and the next file is tried. It is not always
+    first because rfdetr does not write it at interval 1, so a run resumed at that interval leaves
+    an old one behind.
+
+    The .pth files are left out: they hold no optimizer state, so a resume restarts it cold.
+    """
+
+    def modified(path: Path) -> float:
+        return path.stat().st_mtime
+
+    def epoch(path: Path) -> int:
+        return int(NUMBERED_CHECKPOINT.fullmatch(path.name)[1])
+
+    files = list(run.glob("*.ckpt"))
+    numbered = [path for path in files if NUMBERED_CHECKPOINT.fullmatch(path.name)]
+    ordered = sorted(numbered, key=epoch, reverse=True)
+    for path in sorted((path for path in files if path not in numbered), key=modified):
+        no_newer = (at for at, other in enumerate(ordered) if modified(other) <= modified(path))
+        ordered.insert(next(no_newer, len(ordered)), path)
+    return ordered
+
+
+def first_loadable(
+    candidates: list[Path], load: Callable[[Path], dict] = load_checkpoint
+) -> tuple[Path, int] | None:
+    """The first candidate that loads with the epoch it last finished, or None when none does.
+
+    A crash can leave a full-size file that does not load, so none is trusted until it has. A real
+    last.ckpt failed with KeyError "filename 'storages' not found" while an older file worked.
+    """
+    for path in candidates:
+        try:
+            return path, int(load(path)["epoch"])
+        except Exception as error:  # a damaged file raises many types; each one means skip it
+            print(f"skipping {path}: {type(error).__name__}: {error}", flush=True)
+    return None
+
+
+def pick_checkpoint(
+    wanted: Path | bool, runs: Path, load: Callable[[Path], dict] = load_checkpoint
+) -> tuple[Path, int] | None:
+    """The checkpoint --resume means, with the epoch it last finished.
+
+    wanted is the file named on the command line, which is tried alone, or True for the newest run
+    under runs that holds a checkpoint. Only that run is tried: an older one may have trained on
+    other data, so going back to it is a choice to make by naming the file. Prints why and returns
+    None when there is nothing to resume.
+    """
+    if wanted is True:
+        run = newest_checkpoint_run(runs)
+        if run is None:
+            print(f"no run under {runs} holds a checkpoint: nothing to resume", flush=True)
+            return None
+        candidates, where = checkpoints_newest_first(run), run
+    else:
+        candidates, where = [wanted], wanted
+    found = first_loadable(candidates, load)
+    if found is None:
+        print(f"no checkpoint loads from {where}: nothing to resume", flush=True)
+    return found
+
+
 def main(argv: list[str] | None = None) -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(
@@ -185,6 +286,22 @@ def main(argv: list[str] | None = None) -> int:
         help="how many times each train image with a tap anchor goes into the training feed "
         f"(default {ANCHOR_REPEAT}); 1 turns it off",
     )
+    ap.add_argument(
+        "--checkpoint-interval",
+        type=repeat_count,
+        default=CHECKPOINT_INTERVAL,
+        help=f"keep a full checkpoint every this many epochs (default {CHECKPOINT_INTERVAL})",
+    )
+    ap.add_argument(
+        "--resume",
+        nargs="?",
+        type=Path,
+        const=True,
+        default=None,
+        metavar="PATH",
+        help="carry a run on from this checkpoint, in its run folder; with no PATH, from the "
+        "newest checkpoint that loads in the newest run that holds any",
+    )
     args = ap.parse_args(argv)
 
     root = args.root if args.root is not None else default_root()
@@ -194,23 +311,45 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     describe(json.loads(split.read_text(encoding="utf-8")))
 
-    run = root / "runs" / datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    run.mkdir(parents=True, exist_ok=True)
-    print(f"training into {run}")
+    checkpoint = None
+    if args.resume is None:
+        run = root / "runs" / datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        run.mkdir(parents=True, exist_ok=True)
+        print(f"training into {run}")
 
-    dataset = root / "coco"
-    repeated = build_feed(dataset, run / "feed", args.anchor_repeat)
-    if args.anchor_repeat == 1:
-        print("anchor oversampling is off: every train image goes in once")
-    elif repeated:
-        held = "image holds" if repeated == 1 else "images hold"
-        print(
-            f"{repeated} train {held} a tap anchor, each in the training feed "
-            f"{args.anchor_repeat} times: {repeated * (args.anchor_repeat - 1)} extra samples"
-        )
-        dataset = run / "feed"
+        dataset = root / "coco"
+        repeated = build_feed(dataset, run / "feed", args.anchor_repeat)
+        if args.anchor_repeat == 1:
+            print("anchor oversampling is off: every train image goes in once")
+        elif repeated:
+            held = "image holds" if repeated == 1 else "images hold"
+            print(
+                f"{repeated} train {held} a tap anchor, each in the training feed "
+                f"{args.anchor_repeat} times: {repeated * (args.anchor_repeat - 1)} extra samples"
+            )
+            dataset = run / "feed"
+        else:
+            print("no train image holds a tap anchor: nothing to oversample")
     else:
-        print("no train image holds a tap anchor: nothing to oversample")
+        picked = pick_checkpoint(args.resume, root / "runs")
+        if picked is None:
+            return 1
+        checkpoint, finished = picked
+        start = finished + 1
+        if start >= args.epochs:
+            print(
+                f"{checkpoint} already finished epoch {finished}, and --epochs {args.epochs} "
+                f"stops at epoch {args.epochs - 1}: nothing to train",
+                flush=True,
+            )
+            return 1
+        # The same folder, because rfdetr only keeps metrics.csv and the best score there. The
+        # feed already in it, because a new one could differ from what the checkpoint trained on.
+        run = checkpoint.parent
+        feed = run / "feed"
+        dataset = feed if (feed / "train" / ANNOTATIONS).is_file() else root / "coco"
+        print(f"resuming from {checkpoint}, last finished epoch {finished}", flush=True)
+        print(f"start epoch {start}, training into {run} on {dataset}", flush=True)
 
     from rfdetr import RFDETRNano  # here, so a missing split fails before torch loads
 
@@ -222,8 +361,13 @@ def main(argv: list[str] | None = None) -> int:
         grad_accum_steps=args.accum,
         output_dir=str(run),
         num_workers=0,
+        checkpoint_interval=args.checkpoint_interval,
+        resume=None if checkpoint is None else str(checkpoint),
     )
     print(f"run folder {run}")
+    if checkpoint is not None:
+        # export takes the newest folder by name, and a resumed folder keeps its old name
+        print(f"to export this run, name it: uv run tools/play/export.py --run {run}")
     return 0
 
 

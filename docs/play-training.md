@@ -357,6 +357,27 @@ picks and the score are measured on images counted once. Training prints how man
 repeated. When no training image holds a tap anchor, or the flag is 1, it trains on `coco/`
 directly.
 
+Training keeps a full checkpoint, `checkpoint_<epoch>.ckpt`, every two epochs, counted from 0, so
+`checkpoint_29.ckpt` holds the first 30. `--checkpoint-interval` sets how often, as a whole number
+of 1 or more. Each file is about 480 MB, so 60 epochs at the default come to about 15 GB. `last.ckpt`
+is rewritten every epoch on top of those, except at an interval of 1, where it is not written.
+
+After a crash, `--resume` carries the run on instead of starting over:
+
+```
+uv run tools/play/train.py --resume
+```
+
+With no path it takes the newest run under `runs/` that holds a checkpoint and tries that run's
+checkpoints newest first, because a crash can leave a full-size file that does not load. It prints
+each file it skips and why, and stops with an error if none loads. With a path, for example
+`--resume runs/20260918-101112/checkpoint_29.ckpt`, it uses that file or stops. At launch it prints
+the checkpoint and the epoch it starts from. The run carries on in the same folder on the training
+feed already there, so `--anchor-repeat` has no effect. Pass the `--epochs`, `--batch` and `--accum`
+the run started with, because the checkpoint does not set them. A resumed folder keeps its old name
+and export without `--run` takes the newest name, so the run ends by printing the export command
+that names it.
+
 ## Step 8: export
 
 ```
