@@ -205,6 +205,7 @@ class Controller:
         # CAN'T clear escalates to recovery instead of looping forever, and throttle
         # the in-match modal scan so it costs ~nothing on the playing hot path.
         self._ceremony_count = 0  # ceremony screens cleared in the current run cycle
+        self._gallery_rounds = 0  # forced-gallery cannon taps this session, never reset
         self._playing_modal_i = 0  # in-match iteration counter for the modal scan
         self._dismiss_tried = False  # recover() soft dismiss-ladder used this cycle
         self._update_checked = False  # game auto-update store check used this run (never reset)
@@ -504,6 +505,14 @@ class Controller:
         if self._handle_skin_popup(screen):
             self.unknown_clears = 0
             time.sleep(0.6)
+            return
+        # The forced shooting gallery (live on Pie64, 2026-11-05). Handle it BEFORE the
+        # drop tap-through: the safe-point burst misses the cannons, so a launch into it
+        # ended in recover("stuck_returning") every 2 minutes. Bounded by GALLERY_MAX_ROUNDS
+        # per session; once exhausted we fall through to the drop/BACK/recover ladder below.
+        if states.is_forced_gallery(screen) and self._gallery_rounds < config.GALLERY_MAX_ROUNDS:
+            self.handle_forced_gallery()
+            self.unknown_clears = 0
             return
         # A brawler-unlock CEREMONY (single green CTA: LET'S GO / GOT IT) or the
         # CHOOSE-A-BRAWLER chooser (r8 self-heal, live incident). Handle it BEFORE
@@ -1369,6 +1378,19 @@ class Controller:
         time.sleep(config.TAP_SETTLE)
         self.set_phase("returning")  # clear the Starr-drop reveal + any trophy screen
 
+    def handle_forced_gallery(self) -> None:
+        """The forced shooting gallery: its EXIT sign is dead and only taps on its two cannons
+        clear it (about 10, live). One tap per loop pass, alternating the cannons, so every
+        tap follows a fresh is_forced_gallery check and none lands on the screen that comes
+        next. phase_returning holds the per-session cap, config.GALLERY_MAX_ROUNDS."""
+        self._gallery_rounds += 1
+        n = self._gallery_rounds
+        self.dl.event("forced_gallery", round=n)
+        self.log(f"forced gallery -> cannon tap {n}/{config.GALLERY_MAX_ROUNDS}")
+        point = config.GALLERY_CANNON_LEFT if n % 2 else config.GALLERY_CANNON_RIGHT
+        self.tap(point, kind="gallery_cannon")
+        time.sleep(config.TAP_SETTLE)
+
     def handle_team_invite(self, screen) -> None:
         """A TEAM INVITE modal is up (someone wants to team — it blocks the menu and eats
         PLAY taps until it times out). Decline it: tap MUTE (stops repeat invites from
@@ -1507,6 +1529,7 @@ class Controller:
             time.sleep(22)
         except Exception as e:
             self.dl.event("recover_error", err=str(e))
+        self._ceremony_count = 0  # relaunched -> fresh ceremony budget; MAX_RECOVERY is the bound
         self.last_change = time.monotonic()
         self.set_phase("returning")
 

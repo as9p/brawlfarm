@@ -259,3 +259,31 @@ def in_match_modal(screen: np.ndarray) -> bool:
     s, v = hsv[:, :, 1], hsv[:, :, 2]
     mask = (s <= _MODAL_GRAY_SMAX) & (v >= _MODAL_GRAY_VLO) & (v <= _MODAL_GRAY_VHI)
     return float(mask.mean()) >= _MODAL_MIN_FRACTION
+
+
+# Forced shooting gallery (live on Pie64, 1600x900, 2026-11-05): a fullscreen screen a launch
+# can open, cleared only by tapping its two cannons. Classified by color, not a template: the
+# `exit` template is the results button and peaks at 0.48 here against 0.43 on the menu, so it
+# has no valid threshold. Both gates must pass, so neither alone can fire:
+#   wall: bright red across the top band. 0.82-1.00 on 12 gallery frames, 0.19 at most on 27
+#   other frames and 574 captures. The dimmed arena behind CHOOSE A BRAWLER scores 0.00.
+#   sign: the gold EXIT plate in the top left, in a box that holds it across the camera pan
+#   (the plate moves about 30 px). 0.23-0.27 on the gallery. The results EXIT sits bottom right.
+_GALLERY_WALL_REGION = (0, 0, 1600, 80)
+_GALLERY_WALL_LO = (0, 150, 225)
+_GALLERY_WALL_HI = (12, 255, 255)
+_GALLERY_WALL_MIN_FRACTION = 0.50
+_GALLERY_SIGN_REGION = (270, 70, 430, 170)
+_GALLERY_SIGN_LO = (18, 100, 200)
+_GALLERY_SIGN_HI = (32, 255, 255)
+_GALLERY_SIGN_MIN_FRACTION = 0.15
+
+
+def is_forced_gallery(screen: np.ndarray) -> bool:
+    """True if the forced shooting gallery is showing. Color-only, so it is cheap enough for
+    every UNKNOWN frame on the way back to the menu. See _GALLERY_*."""
+    wall = vision.color_fraction(screen, _GALLERY_WALL_REGION, _GALLERY_WALL_LO, _GALLERY_WALL_HI)
+    if wall < _GALLERY_WALL_MIN_FRACTION:
+        return False
+    sign = vision.color_fraction(screen, _GALLERY_SIGN_REGION, _GALLERY_SIGN_LO, _GALLERY_SIGN_HI)
+    return sign >= _GALLERY_SIGN_MIN_FRACTION
