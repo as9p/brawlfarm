@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tools.play import export, thresholds
+from tools.play import classes, export, thresholds
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "tools" / "play"
 
@@ -135,6 +135,132 @@ def test_export_flag_rejects_a_precision_outside_zero_to_one(value):
     with pytest.raises(SystemExit) as raised:
         export.parser().parse_args(["--min-precision-other", value])
     assert raised.value.code == 2
+
+
+def test_export_flags_for_the_other_classes_exclude_each_other():
+    assert export.parser().parse_args([]).best_f1_other is False
+    assert export.parser().parse_args(["--best-f1-other"]).best_f1_other is True
+    with pytest.raises(SystemExit) as raised:
+        export.parser().parse_args(["--best-f1-other", "--min-precision-other", "0.8"])
+    assert raised.value.code == 2
+
+
+# 18 of 20 boxes true against 30 real ones is F1 0.72 up to 0.35, against 0.46 at 0.61, where the
+# precision is clean and half the truth is gone. 0.35 is the top of that tie.
+def test_pick_best_f1_trades_precision_for_recall():
+    assert thresholds.pick_best_f1("enemy", _NINETY_SCORES, _NINETY_HITS, 30) == 0.35
+    assert thresholds.pick(_NINETY_SCORES, _NINETY_HITS) == pytest.approx(0.61)
+
+
+def test_pick_best_f1_counts_the_truth_no_detection_reached():
+    scores = [0.9] * 30 + [0.5] * 30
+    hits = [True] * 30 + [True] * 10 + [False] * 20
+    assert thresholds.pick_best_f1("enemy", scores, hits, 40) == pytest.approx(0.90)
+    assert thresholds.pick_best_f1("enemy", scores, hits, 200) == pytest.approx(0.50)
+
+
+def test_pick_best_f1_finds_a_threshold_above_the_noise():
+    scores = [0.9] * 30 + [0.5] * 30
+    hits = [True] * 30 + [False] * 30
+    assert thresholds.pick_best_f1("enemy", scores, hits, 30) == pytest.approx(0.90)
+
+
+def test_pick_best_f1_takes_the_higher_threshold_on_a_tie():
+    assert thresholds.pick_best_f1("enemy", [0.7] * 30, [True] * 30, 30) == pytest.approx(0.70)
+
+
+def test_pick_best_f1_returns_the_ceiling_with_too_little_truth():
+    scores = [0.9] * 29
+    hits = [True] * 29
+    assert thresholds.pick_best_f1("enemy", scores, hits, 29) == thresholds.CEILING
+
+
+def test_pick_best_f1_returns_the_ceiling_without_a_true_positive():
+    assert thresholds.pick_best_f1("enemy", [], [], 30) == thresholds.CEILING
+    assert thresholds.pick_best_f1("enemy", [0.9, 0.8], [False, False], 30) == thresholds.CEILING
+
+
+@pytest.mark.parametrize("name", sorted(classes.TAP_ANCHORS))
+def test_best_f1_can_never_apply_to_a_tap_anchor(name):
+    assert thresholds.rule_for(name, best_f1=True) == thresholds.RULE_PRECISION
+    with pytest.raises(ValueError, match="tap anchor"):
+        thresholds.pick_best_f1(name, _NINETY_SCORES, _NINETY_HITS, 30)
+
+    # scores where the two rules disagree, so a leak would move the number
+    asked = export.pick_thresholds(
+        [name], {0: _NINETY_SCORES}, {0: _NINETY_HITS}, {0: 30}, 0.5, best_f1=True
+    )
+    plain = export.pick_thresholds([name], {0: _NINETY_SCORES}, {0: _NINETY_HITS}, {0: 30}, 0.5)
+    assert asked == plain
+    assert asked[0][name] == pytest.approx(0.61)
+    assert asked[1][name]["min_precision"] == thresholds.MIN_PRECISION
+    assert asked[1][name]["rule"] == thresholds.RULE_PRECISION
+
+
+def test_every_class_has_exactly_one_rule_under_best_f1():
+    for name in classes.CLASSES:
+        expected = (
+            thresholds.RULE_PRECISION if name in classes.TAP_ANCHORS else thresholds.RULE_BEST_F1
+        )
+        assert thresholds.rule_for(name, best_f1=True) == expected
+        assert thresholds.rule_for(name) == thresholds.RULE_PRECISION
+
+
+def test_pick_thresholds_records_the_rule_of_a_best_f1_class():
+    picked, validation = export.pick_thresholds(
+        ["self", "play_button"],
+        {0: _NINETY_SCORES, 1: _NINETY_SCORES},
+        {0: _NINETY_HITS, 1: _NINETY_HITS},
+        {0: 30, 1: 30},
+        thresholds.MIN_PRECISION_OTHER,
+        best_f1=True,
+    )
+    assert picked == {"self": 0.35, "play_button": pytest.approx(0.61)}
+    assert validation["self"]["rule"] == thresholds.RULE_BEST_F1
+    assert validation["self"]["certified"] is True
+    assert validation["self"]["min_precision"] is None
+    assert validation["self"]["f1_at_threshold"] == pytest.approx(2 * 18 / (20 + 30), abs=1e-4)
+    assert validation["play_button"]["rule"] == thresholds.RULE_PRECISION
+    assert "f1_at_threshold" not in validation["play_button"]
+
+
+def test_pick_thresholds_records_precision_rule_without_best_f1():
+    _picked, validation = export.pick_thresholds(
+        ["self"], {0: _NINETY_SCORES}, {0: _NINETY_HITS}, {0: 30}, thresholds.MIN_PRECISION_OTHER
+    )
+    assert validation["self"]["rule"] == thresholds.RULE_PRECISION
+
+
+def test_best_f1_class_with_too_little_truth_gets_the_ceiling_uncertified(capsys):
+    picked, validation = export.pick_thresholds(
+        ["enemy"],
+        {0: _NINETY_SCORES},
+        {0: _NINETY_HITS},
+        {0: thresholds.MIN_TRUTH - 1},
+        thresholds.MIN_PRECISION_OTHER,
+        best_f1=True,
+    )
+    assert picked["enemy"] == thresholds.CEILING
+    assert validation["enemy"]["certified"] is False
+    assert validation["enemy"]["rule"] == thresholds.RULE_CEILING
+    assert "WARNING: enemy is not certified: 29 validation truth boxes" in capsys.readouterr().out
+
+
+def test_best_f1_class_without_a_true_positive_gets_the_ceiling_uncertified(capsys):
+    picked, validation = export.pick_thresholds(
+        ["enemy"], {0: [0.9]}, {0: [False]}, {0: 500}, 0.9, best_f1=True
+    )
+    assert picked["enemy"] == thresholds.CEILING
+    assert validation["enemy"]["certified"] is False
+    assert validation["enemy"]["rule"] == thresholds.RULE_CEILING
+    assert "WARNING: enemy is not certified: 0.95 is the fallback" in capsys.readouterr().out
+
+
+def test_a_precision_fallback_is_recorded_as_the_ceiling():
+    _picked, validation = export.pick_thresholds(
+        ["play_button"], {0: []}, {0: []}, {0: 500}, thresholds.MIN_PRECISION_OTHER, best_f1=True
+    )
+    assert validation["play_button"]["rule"] == thresholds.RULE_CEILING
 
 
 def test_min_truth_is_thirty_and_coco_warns_against_the_same_number():

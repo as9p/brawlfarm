@@ -7,6 +7,11 @@ single number for the whole model, and it never drops below FLOOR however clean 
 A tap anchor (classes.TAP_ANCHORS) is held to MIN_PRECISION; every other class is only ever
 watched, never tapped, and is held to the looser MIN_PRECISION_OTHER.
 
+A precision target can price a watched class out of being seen at all: it lands so high that
+nearly every real box is dropped. So the exporter can instead be asked for best F1 on the classes
+that are only watched (pick_best_f1). rule_for is the one place that decides, and it never hands
+best F1 to a tap anchor, which stays on MIN_PRECISION whatever was asked for.
+
 This module is imported by train.py and export.py, which run in their own isolated environment
 with rfdetr and torch in it and no brawlfarm. It therefore imports numpy and the standard
 library only, pulls cv2 in inside preprocess where a resize is unavoidable, and pulls the
@@ -24,6 +29,9 @@ MIN_PRECISION = 0.98
 # a class the controller only watches: a false positive costs a wrong guess, not a tap
 MIN_PRECISION_OTHER = 0.90
 FLOOR, CEILING = 0.30, 0.95
+# what play.json records as the rule behind a threshold; RULE_CEILING is the fallback, whichever
+# rule was tried first
+RULE_PRECISION, RULE_BEST_F1, RULE_CEILING = "precision", "best_f1", "ceiling"
 # Below this many validation truth boxes a class's precision swings on a box or two, so export.py
 # does not certify its threshold, and coco.py warns about a valid or test split that thin.
 MIN_TRUTH = 30
@@ -77,6 +85,13 @@ def target_for(name: str, *, other: float = MIN_PRECISION_OTHER) -> float:
     return MIN_PRECISION if name in classes.TAP_ANCHORS else other
 
 
+def rule_for(name: str, *, best_f1: bool = False) -> str:
+    """RULE_BEST_F1 if it was asked for and `name` is not a tap anchor, else RULE_PRECISION."""
+    from tools.play import classes  # inside the body: the import test allows numpy at top level
+
+    return RULE_BEST_F1 if best_f1 and name not in classes.TAP_ANCHORS else RULE_PRECISION
+
+
 def pick(
     scores: Sequence[float], is_tp: Sequence[bool], *, min_precision: float = MIN_PRECISION
 ) -> float:
@@ -97,6 +112,31 @@ def pick(
         if total and int(true[above].sum()) / total >= min_precision:
             return threshold
     return CEILING
+
+
+def pick_best_f1(name: str, scores: Sequence[float], is_tp: Sequence[bool], truth: int) -> float:
+    """The threshold in [FLOOR, CEILING] with the best F1 against `truth` real boxes.
+
+    Walks the same grid as pick, and a tie goes to the higher threshold, the cleaner of the two.
+    A class with fewer than MIN_TRUTH truth boxes, or with no true positive at any threshold,
+    gets CEILING: there is nothing to balance. A tap anchor is refused outright, because a false
+    tap costs far more than a miss and F1 prices the two the same.
+    """
+    if rule_for(name, best_f1=True) != RULE_BEST_F1:
+        raise ValueError(f"{name} is a tap anchor: its threshold is never picked by F1")
+    if truth < MIN_TRUTH:
+        return CEILING
+    keep = np.asarray(scores, dtype=np.float64)
+    true = np.asarray(is_tp, dtype=bool)
+    best, best_f1 = CEILING, 0.0
+    steps = int(round((CEILING - FLOOR) * 100))
+    for step in range(steps + 1):
+        threshold = round(FLOOR + step / 100, 2)
+        above = keep >= threshold
+        f1 = 2 * int(true[above].sum()) / (int(above.sum()) + truth)
+        if f1 > 0 and f1 >= best_f1:
+            best, best_f1 = threshold, f1
+    return best
 
 
 def decode(

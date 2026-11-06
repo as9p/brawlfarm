@@ -17,6 +17,7 @@ but tools/play/thresholds.py and tools/play/classes.py:
     uv run tools/play/export.py
     uv run tools/play/export.py --root D:/play-data --run 20260920-231500
     uv run tools/play/export.py --min-precision-other 0.85
+    uv run tools/play/export.py --best-f1-other
 
 The export is checked before it is believed. The library's own predict and a hand-rolled
 onnxruntime pass over the same validation images must agree on nearly every box, which is what
@@ -25,11 +26,14 @@ neighbour, and every check downstream still looks fine. Only then does each clas
 lowest threshold that still buys its precision target on the validation set, and only then
 are models/play.onnx and models/play.json written. A tap anchor's target is always
 thresholds.MIN_PRECISION; every other class gets --min-precision-other, which defaults to
-thresholds.MIN_PRECISION_OTHER.
+thresholds.MIN_PRECISION_OTHER. --best-f1-other replaces that target with the validation
+threshold of best F1, on those classes only: a tap anchor keeps thresholds.MIN_PRECISION.
 
 play.json also records, per class, how many validation truth boxes the threshold was drawn from
 and whether it is certified: at least thresholds.MIN_TRUTH of them, and a threshold that really
 reached its target rather than the 0.95 fallback. Every class that is not certified is printed.
+Its `rule` says what set the threshold: precision, best_f1, or ceiling for that fallback. A
+best_f1 class has no precision target, so its min_precision is null and it records its F1.
 """
 
 from __future__ import annotations
@@ -151,13 +155,20 @@ def parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--root", type=Path, default=None, help="dataset root")
     ap.add_argument("--run", default=None, help="run folder, or its name under runs/")
-    ap.add_argument(
+    other = ap.add_mutually_exclusive_group()
+    other.add_argument(
         "--min-precision-other",
         type=precision,
         default=thresholds.MIN_PRECISION_OTHER,
         help="precision target for every class that is not a tap anchor "
         f"(default {thresholds.MIN_PRECISION_OTHER}); tap anchors always use "
         f"{thresholds.MIN_PRECISION}",
+    )
+    other.add_argument(
+        "--best-f1-other",
+        action="store_true",
+        help="pick every class that is not a tap anchor by best F1 on the validation split "
+        f"instead of a precision target; tap anchors still use {thresholds.MIN_PRECISION}",
     )
     return ap
 
@@ -168,6 +179,8 @@ def pick_thresholds(
     hits: dict[int, list[bool]],
     truth_counts: dict[int, int],
     min_precision_other: float,
+    *,
+    best_f1: bool = False,
 ) -> tuple[dict[str, float], dict[str, dict]]:
     """Every class's threshold, and the validation numbers play.json records next to it.
 
@@ -176,26 +189,43 @@ def pick_thresholds(
     that thresholds.pick falls back to when no threshold does is still written, so the class
     stays effectively off, but it is never certified, however many boxes there were. Every class
     that is not certified is printed with its reasons.
+
+    With `best_f1`, a class that is not a tap anchor takes pick_best_f1 instead. It has no target
+    to reach, so it is certified when it has the truth boxes and a true positive at its threshold;
+    without them it gets the same CEILING, certified false. A tap anchor never takes this branch.
     """
     picked: dict[str, float] = {}
     validation: dict[str, dict] = {}
     uncertified: list[tuple[str, list[str]]] = []
     for index, name in enumerate(names):
-        target = thresholds.target_for(name, other=min_precision_other)
-        threshold = thresholds.pick(scores[index], hits[index], min_precision=target)
+        truth = truth_counts[index]
+        rule = thresholds.rule_for(name, best_f1=best_f1)
+        target = None
+        if rule == thresholds.RULE_BEST_F1:
+            threshold = thresholds.pick_best_f1(name, scores[index], hits[index], truth)
+        else:
+            target = thresholds.target_for(name, other=min_precision_other)
+            threshold = thresholds.pick(scores[index], hits[index], min_precision=target)
         above = [
             hit for score, hit in zip(scores[index], hits[index], strict=True) if score >= threshold
         ]
-        truth = truth_counts[index]
         reasons = []
         if truth < thresholds.MIN_TRUTH:
             reasons.append(f"{truth} validation truth boxes, fewer than {thresholds.MIN_TRUTH}")
-        # the same test pick ran: nothing above the threshold reached the target, so it fell back
-        if not above or sum(above) / len(above) < target:
-            reasons.append(
-                f"{threshold:.2f} is the fallback, no threshold reached its {target:.2f} "
-                "precision target"
-            )
+        if target is None:
+            fell_back = truth < thresholds.MIN_TRUTH or not any(above)
+            if not any(above):
+                reasons.append(f"{threshold:.2f} is the fallback, no true positive above it")
+        else:
+            # the same test pick ran: nothing above the threshold reached the target
+            fell_back = not above or sum(above) / len(above) < target
+            if fell_back:
+                reasons.append(
+                    f"{threshold:.2f} is the fallback, no threshold reached its {target:.2f} "
+                    "precision target"
+                )
+        if fell_back:
+            rule = thresholds.RULE_CEILING
         picked[name] = threshold
         validation[name] = {
             "truth": truth,
@@ -203,13 +233,14 @@ def pick_thresholds(
             "detections": len(above),
             "precision_at_threshold": round(sum(above) / len(above), 4) if above else 0.0,
             "min_precision": target,
+            "rule": rule,
         }
+        if rule == thresholds.RULE_BEST_F1:
+            validation[name]["f1_at_threshold"] = round(2 * sum(above) / (len(above) + truth), 4)
         if reasons:
             uncertified.append((name, reasons))
-        print(
-            f"  {name} threshold {threshold:.2f} target {target:.2f} "
-            f"truth {truth} detections {len(above)}"
-        )
+        basis = f"target {target:.2f}" if target is not None else f"rule {rule}"
+        print(f"  {name} threshold {threshold:.2f} {basis} truth {truth} detections {len(above)}")
     if uncertified:
         print("")
         for name, reasons in uncertified:
@@ -319,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     picked, validation = pick_thresholds(
-        names, scores, hits, truth_counts, args.min_precision_other
+        names, scores, hits, truth_counts, args.min_precision_other, best_f1=args.best_f1_other
     )
 
     models = root / "models"
