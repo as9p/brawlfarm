@@ -9,6 +9,7 @@ in training goes missing here too.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import types
 from collections import Counter, defaultdict
@@ -279,3 +280,229 @@ def test_main_prints_the_device_right_before_training(tmp_path, fake_rfdetr, mon
 
     out = capsys.readouterr().out
     assert out.index("tap anchor") < out.index("training device cpu") < out.index("training starts")
+
+
+def _ckpts(run: Path, names_and_mtimes: dict[str, int]) -> Path:
+    """Empty checkpoint files in run, each stamped with a fixed modification time."""
+    run.mkdir(parents=True, exist_ok=True)
+    for name, mtime in names_and_mtimes.items():
+        (run / name).write_bytes(b"")
+        os.utime(run / name, (mtime, mtime))
+    return run
+
+
+def _names(paths: list[Path]) -> list[str]:
+    return [path.name for path in paths]
+
+
+def test_checkpoints_newest_first_sorts_numbered_files_by_epoch_not_text(tmp_path):
+    run = _ckpts(
+        tmp_path / "r", {"checkpoint_9.ckpt": 30, "checkpoint_10.ckpt": 10, "checkpoint_1.ckpt": 20}
+    )
+
+    got = train.checkpoints_newest_first(run)
+
+    assert _names(got) == ["checkpoint_10.ckpt", "checkpoint_9.ckpt", "checkpoint_1.ckpt"]
+
+
+def test_checkpoints_newest_first_leaves_out_pth_files(tmp_path):
+    run = _ckpts(tmp_path / "r", {"checkpoint_3.ckpt": 10, "checkpoint_3.pth": 20, "best.pth": 30})
+
+    assert _names(train.checkpoints_newest_first(run)) == ["checkpoint_3.ckpt"]
+
+
+def test_checkpoints_newest_first_puts_a_fresh_last_ckpt_first(tmp_path):
+    run = _ckpts(
+        tmp_path / "r", {"checkpoint_1.ckpt": 10, "checkpoint_3.ckpt": 20, "last.ckpt": 30}
+    )
+
+    assert _names(train.checkpoints_newest_first(run)) == [
+        "last.ckpt",
+        "checkpoint_3.ckpt",
+        "checkpoint_1.ckpt",
+    ]
+
+
+def test_checkpoints_newest_first_puts_a_stale_last_ckpt_behind_the_newer_numbered_files(tmp_path):
+    # a run resumed at interval 1 leaves an old last.ckpt behind: it must not lead
+    run = _ckpts(
+        tmp_path / "r",
+        {"last.ckpt": 10, "checkpoint_1.ckpt": 5, "checkpoint_3.ckpt": 20, "checkpoint_5.ckpt": 30},
+    )
+
+    assert _names(train.checkpoints_newest_first(run)) == [
+        "checkpoint_5.ckpt",
+        "checkpoint_3.ckpt",
+        "last.ckpt",
+        "checkpoint_1.ckpt",
+    ]
+
+
+def test_checkpoints_newest_first_of_a_lone_last_ckpt_or_nothing(tmp_path):
+    assert _names(train.checkpoints_newest_first(_ckpts(tmp_path / "a", {"last.ckpt": 1}))) == [
+        "last.ckpt"
+    ]
+    assert train.checkpoints_newest_first(_ckpts(tmp_path / "b", {})) == []
+
+
+def _loader(outcomes: dict[str, object]):
+    """A loader that returns {"epoch": n} for a name mapped to n and raises an exception mapped."""
+
+    def load(path: Path) -> dict:
+        outcome = outcomes[path.name]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return {"epoch": outcome}
+
+    return load
+
+
+def test_first_loadable_skips_a_damaged_file_and_returns_the_next(tmp_path, capsys):
+    damaged = tmp_path / "last.ckpt"
+    good = tmp_path / "checkpoint_3.ckpt"
+    load = _loader({"last.ckpt": KeyError("filename 'storages' not found"), good.name: 3})
+
+    assert train.first_loadable([damaged, good], load) == (good, 3)
+    assert "skipping" in capsys.readouterr().out
+
+
+def test_first_loadable_takes_the_first_that_loads_and_goes_no_further(tmp_path):
+    first, second = tmp_path / "checkpoint_5.ckpt", tmp_path / "checkpoint_3.ckpt"
+    asked: list[str] = []
+
+    def load(path: Path) -> dict:
+        asked.append(path.name)
+        return {"epoch": 5}
+
+    assert train.first_loadable([first, second], load) == (first, 5)
+    assert asked == [first.name]
+
+
+def test_first_loadable_is_none_when_nothing_loads_or_nothing_is_offered(tmp_path):
+    load = _loader({"a.ckpt": OSError("short read"), "b.ckpt": EOFError("truncated")})
+
+    assert train.first_loadable([tmp_path / "a.ckpt", tmp_path / "b.ckpt"], load) is None
+    assert train.first_loadable([], load) is None
+
+
+def test_newest_checkpoint_run_skips_a_newer_folder_with_no_checkpoint(tmp_path):
+    runs = tmp_path / "runs"
+    _ckpts(runs / "20260101-000000", {"checkpoint_1.ckpt": 1})
+    (runs / "20260102-000000").mkdir()
+    (runs / "20260103-000000").mkdir()
+    (runs / "20260103-000000" / "metrics.csv").write_text("x", encoding="utf-8")
+
+    assert train.newest_checkpoint_run(runs) == runs / "20260101-000000"
+
+
+def test_newest_checkpoint_run_takes_the_last_name_among_runs_with_checkpoints(tmp_path):
+    runs = tmp_path / "runs"
+    _ckpts(runs / "20260101-000000", {"last.ckpt": 1})
+    _ckpts(runs / "20260102-000000", {"last.ckpt": 1})
+
+    assert train.newest_checkpoint_run(runs) == runs / "20260102-000000"
+
+
+def test_newest_checkpoint_run_is_none_with_no_checkpoint_or_no_runs_folder(tmp_path):
+    runs = tmp_path / "runs"
+    (runs / "20260101-000000").mkdir(parents=True)
+    (runs / "stray.ckpt").write_bytes(b"")  # a file, not a run folder
+
+    assert train.newest_checkpoint_run(runs) is None
+    assert train.newest_checkpoint_run(tmp_path / "missing") is None
+
+
+def test_pick_checkpoint_with_a_path_tries_that_file_alone(tmp_path):
+    runs = tmp_path / "runs"
+    _ckpts(runs / "20260102-000000", {"checkpoint_9.ckpt": 1})
+    named = _ckpts(runs / "20260101-000000", {"checkpoint_2.ckpt": 1}) / "checkpoint_2.ckpt"
+
+    assert train.pick_checkpoint(named, runs, _loader({named.name: 2})) == (named, 2)
+
+
+def test_pick_checkpoint_with_a_path_that_does_not_load_is_none(tmp_path, capsys):
+    named = tmp_path / "checkpoint_2.ckpt"
+    load = _loader({named.name: RuntimeError("bad")})
+
+    assert train.pick_checkpoint(named, tmp_path, load) is None
+    assert "nothing to resume" in capsys.readouterr().out
+
+
+def test_pick_checkpoint_bare_resume_falls_back_inside_the_newest_run_only(tmp_path):
+    runs = tmp_path / "runs"
+    _ckpts(runs / "20260101-000000", {"checkpoint_7.ckpt": 1})
+    newest = _ckpts(runs / "20260102-000000", {"checkpoint_3.ckpt": 10, "last.ckpt": 20})
+    load = _loader({"last.ckpt": KeyError("storages"), "checkpoint_3.ckpt": 3})
+
+    assert train.pick_checkpoint(True, runs, load) == (newest / "checkpoint_3.ckpt", 3)
+
+
+def test_pick_checkpoint_bare_resume_never_goes_back_to_an_older_run(tmp_path):
+    runs = tmp_path / "runs"
+    _ckpts(runs / "20260101-000000", {"checkpoint_7.ckpt": 1})
+    _ckpts(runs / "20260102-000000", {"last.ckpt": 20})
+
+    load = _loader({"last.ckpt": EOFError("truncated"), "checkpoint_7.ckpt": 7})
+    assert train.pick_checkpoint(True, runs, load) is None
+
+
+def test_pick_checkpoint_bare_resume_with_nothing_to_resume_says_so(tmp_path, capsys):
+    assert train.pick_checkpoint(True, tmp_path / "runs", _loader({})) is None
+    assert "nothing to resume" in capsys.readouterr().out
+
+
+@pytest.fixture
+def picked(monkeypatch):
+    """Stand-in for pick_checkpoint that records what --resume parsed to and finds nothing."""
+    seen: list[object] = []
+    monkeypatch.setattr(train, "pick_checkpoint", lambda wanted, runs: seen.append(wanted))
+    return seen
+
+
+def test_main_resume_with_no_value_means_the_newest_run(tmp_path, fake_rfdetr, picked):
+    _write_coco(tmp_path)
+    _write_split(tmp_path)
+
+    assert train.main(["--root", str(tmp_path), "--resume"]) == 1
+
+    assert picked == [True]
+    assert fake_rfdetr == []
+
+
+def test_main_resume_with_a_path_hands_that_path_over(tmp_path, fake_rfdetr, picked):
+    _write_coco(tmp_path)
+    _write_split(tmp_path)
+
+    assert train.main(["--root", str(tmp_path), "--resume", str(tmp_path / "x.ckpt")]) == 1
+
+    assert picked == [tmp_path / "x.ckpt"]
+
+
+def test_main_without_resume_starts_a_fresh_run_and_passes_no_checkpoint(
+    tmp_path, fake_rfdetr, picked
+):
+    _write_coco(tmp_path)
+    _write_split(tmp_path)
+
+    assert train.main(["--root", str(tmp_path)]) == 0
+
+    assert picked == []
+    assert fake_rfdetr[0]["resume"] is None
+    assert fake_rfdetr[0]["checkpoint_interval"] == train.CHECKPOINT_INTERVAL
+
+
+def test_main_passes_the_checkpoint_interval_through(tmp_path, fake_rfdetr):
+    _write_coco(tmp_path)
+    _write_split(tmp_path)
+
+    assert train.main(["--root", str(tmp_path), "--checkpoint-interval", "5"]) == 0
+
+    assert fake_rfdetr[0]["checkpoint_interval"] == 5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "2.5", "abc"])
+def test_main_refuses_a_checkpoint_interval_below_one(tmp_path, value, fake_rfdetr):
+    with pytest.raises(SystemExit) as raised:
+        train.main(["--root", str(tmp_path), "--checkpoint-interval", value])
+    assert raised.value.code == 2
+    assert fake_rfdetr == []
