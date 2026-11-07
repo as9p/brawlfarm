@@ -20,7 +20,7 @@ import pytest
 
 from brawlfarm import play
 from brawlfarm.core.states import State
-from brawlfarm.play import capture, detect, session
+from brawlfarm.play import capture, detect, reader, rules, session
 
 HUNG_LIMIT = 10.0  # seconds a hung fake capture waits before it gives up on the test
 TICK_BOUND = 1.0  # seconds: what a controller tick may cost, well under one JOIN_TIMEOUT
@@ -225,6 +225,11 @@ def test_the_happy_path_writes_a_file_and_reports_on_and_a_summary(h: Harness, t
         "stale_ticks",
         "boxes",
         "file",
+        "rules_ms_p50",
+        "rules_ms_p95",
+        "coverage",
+        "rule_calls",
+        "rules_errors",
     }
 
     written = tmp_path / done["file"]
@@ -233,7 +238,7 @@ def test_the_happy_path_writes_a_file_and_reports_on_and_a_summary(h: Harness, t
     assert len(lines) == 4
     assert set(lines[0]) == HEADER_KEYS
     assert lines[0]["classes"] == ["enemy", "bush"] and lines[0]["rate_hz"] == session.RATE_HZ
-    assert set(lines[1]) == {"t", "age", "ms", "boxes"}
+    assert set(lines[1]) == {"t", "age", "ms", "boxes", "rules_ms", "read", "rules", "farm"}
     assert lines[1]["boxes"] == [["enemy", 0.912, 10, 20, 30, 40], ["bush", 0.555, 1, 2, 3, 4]]
     assert h.sources[0].stopped and not h.session.active
 
@@ -452,6 +457,226 @@ def test_close_without_a_session_says_nothing(h: Harness) -> None:
     assert h.session.close() == []
 
 
+# -- the reader and the rules on each row --------------------------------------------
+
+
+READING = reader.Reading(
+    teams_left=4,
+    self_health=np.int64(3200),
+    self_health_fraction=np.float32(0.5),
+    self_ammo=0,
+    cube_count=2,
+    enemy_health=(np.int64(1000), 800),
+)
+SELF_AND_CUBE = [
+    detect.Box(cls="self", score=0.9, x=780.0, y=430.0, w=40.0, h=40.0),
+    detect.Box(cls="power_cube", score=0.8, x=840.0, y=430.0, w=30.0, h=30.0),
+]
+
+
+def rows_of(folder: Path, done: dict) -> list[dict]:
+    lines = (folder / done["file"]).read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines[1:]]
+
+
+def reading_is(monkeypatch, *readings) -> None:
+    """The reader hands these out in turn, the last one for good."""
+    queue = list(readings)
+    monkeypatch.setattr(
+        reader, "read", lambda frame, boxes: queue.pop(0) if len(queue) > 1 else queue[0]
+    )
+
+
+def boom(*args, **kwargs):
+    raise RuntimeError("bad read")
+
+
+def test_a_row_carries_the_reader_the_rules_and_the_farm_label(h, tmp_path, monkeypatch) -> None:
+    reading_is(monkeypatch, READING)
+    h.detector.boxes = SELF_AND_CUBE
+    h.session.observe(State.IN_MATCH, "playing")
+    h.now[0] += 0.25
+    h.run()
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+
+    row = rows_of(tmp_path, done)[0]
+    assert row["read"] == {
+        "teams_left": 4,
+        "self_health": 3200,
+        "self_health_fraction": 0.5,
+        "self_ammo": 0,
+        "cube_count": 2,
+        "enemy_health": [1000, 800],
+        "teammates_alive": None,
+    }
+    assert row["rules"] == {
+        "centre": None,
+        "cubes": {"label": "take_cube", "reason": "cube_near"},
+        "exit": None,
+    }
+    assert row["farm"] == {"state": "in_match", "phase": "playing", "age": 0.25}
+    assert row["boxes"][0] == ["self", 0.9, 780, 430, 40, 40]
+
+
+def test_the_real_reader_runs_on_a_blank_frame_and_reads_nothing(h, tmp_path) -> None:
+    h.session.observe(State.IN_MATCH, "playing")
+    h.run()
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+
+    row = rows_of(tmp_path, done)[0]
+    read = row["read"]
+    assert read.pop("enemy_health") == [] and set(read.values()) == {None}
+    assert row["rules"] == {"centre": None, "cubes": None, "exit": None}
+    assert done["rules_errors"] == 0
+
+
+def test_rules_ms_times_the_reader_and_the_rules_and_ms_stays_the_detector(
+    h, tmp_path, monkeypatch
+) -> None:
+    def slow_read(frame, boxes):
+        h.now[0] += 0.04
+        return READING
+
+    real = rules.evaluate
+
+    def slow_rules(reading, boxes, context):
+        h.now[0] += 0.01
+        return real(reading, boxes, context)
+
+    monkeypatch.setattr(reader, "read", slow_read)
+    monkeypatch.setattr(rules, "evaluate", slow_rules)
+    h.session.observe(State.IN_MATCH, "playing")
+    h.run(ticks=2)
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+
+    row = rows_of(tmp_path, done)[0]
+    assert row["rules_ms"] == pytest.approx(50.0, abs=0.2) and row["ms"] == 0.0
+    assert done["rules_ms_p50"] == pytest.approx(50.0, abs=0.2)
+    assert done["rules_ms_p95"] == pytest.approx(50.0, abs=0.2)
+    assert done["ms_p50"] == 0.0
+
+
+def test_the_summary_has_coverage_per_field_and_calls_per_rule(h, monkeypatch) -> None:
+    bare = reader.Reading(teams_left=4)
+    reading_is(monkeypatch, READING, bare, bare, bare)
+    h.detector.boxes = SELF_AND_CUBE
+    h.session.observe(State.IN_MATCH, "playing")
+    h.run(ticks=4)
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+
+    assert done["coverage"] == {
+        "teams_left": 1.0,
+        "self_health": 0.25,
+        "self_health_fraction": 0.25,
+        "self_ammo": 0.25,  # a read of zero ammo is a read
+        "cube_count": 0.25,
+        "enemy_health": 0.25,  # an empty tuple is nothing read
+        "teammates_alive": 0.0,
+    }
+    assert done["rule_calls"] == {"centre": 0, "cubes": 4, "exit": 0}
+    assert done["rules_errors"] == 0
+
+
+def test_a_lone_enemy_box_waits_for_the_frames_after_it_and_a_new_match_forgets(
+    h, tmp_path, monkeypatch
+) -> None:
+    reading_is(monkeypatch, reader.Reading())  # no enemy bar: only the frames can back the box
+    h.detector.boxes = [
+        detect.Box(cls="self", score=0.9, x=780.0, y=430.0, w=40.0, h=40.0),
+        detect.Box(cls="enemy", score=0.7, x=1080.0, y=430.0, w=40.0, h=40.0),
+        detect.Box(cls="bush", score=0.7, x=580.0, y=430.0, w=40.0, h=40.0),
+    ]
+    h.session.observe(State.IN_MATCH, "playing")
+    h.run(ticks=rules.ENEMY_FRAMES)
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+    h.session.observe(State.MENU, "at_menu")
+
+    calls = [row["rules"]["exit"] for row in rows_of(tmp_path, done)]
+    assert calls[:-1] == [None] * (rules.ENEMY_FRAMES - 1)
+    assert calls[-1] == {"label": "engage_ok", "reason": "bush_exit"}
+
+    h.now[0] += 2.0
+    h.session.observe(State.IN_MATCH, "playing")
+    h.run()
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+    assert rows_of(tmp_path, done)[0]["rules"]["exit"] is None
+
+
+def test_a_reader_that_raises_costs_the_fields_and_not_the_session(
+    h, tmp_path, monkeypatch, caplog
+) -> None:
+    monkeypatch.setattr(reader, "read", boom)
+    h.session.observe(State.IN_MATCH, "playing")
+    h.session._begin()
+
+    with caplog.at_level("WARNING", logger="brawlfarm.play.session"):
+        assert all(h.session._tick() for _ in range(3))
+    assert h.session.active
+
+    events = h.session.observe(State.RESULTS, "playing")
+
+    assert kinds(events) == ["play_on", "play_summary"]
+    done = dict(events)["play_summary"]
+    assert done["frames"] == 3 and done["rules_errors"] == 3
+    assert done["coverage"] == {} and done["rule_calls"] == {}
+    rows = rows_of(tmp_path, done)
+    assert [(row["read"], row["rules"]) for row in rows] == [(None, None)] * 3
+    assert rows[0]["boxes"] and rows[0]["farm"]["state"] == "in_match"
+    assert len([r for r in caplog.records if "rules error" in r.getMessage()]) == 1
+
+
+def test_rules_that_raise_keep_the_reading_and_the_session(h, tmp_path, monkeypatch) -> None:
+    reading_is(monkeypatch, READING)
+    monkeypatch.setattr(rules, "evaluate", boom)
+    h.session.observe(State.IN_MATCH, "playing")
+    h.session._begin()
+
+    assert h.session._tick() is True
+
+    events = h.session.observe(State.RESULTS, "playing")
+    assert "play_fallback" not in kinds(events)
+    done = dict(events)["play_summary"]
+    assert done["rules_errors"] == 1 and done["coverage"]["teams_left"] == 1.0
+    row = rows_of(tmp_path, done)[0]
+    assert row["read"]["teams_left"] == 4 and row["rules"] is None
+
+
+def test_a_reading_json_cannot_hold_is_caught_before_the_row_is_written(
+    h, tmp_path, monkeypatch
+) -> None:
+    reading_is(monkeypatch, reader.Reading(teams_left=object()))
+    h.session.observe(State.IN_MATCH, "playing")
+    h.session._begin()
+
+    assert h.session._tick() is True
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+    assert done["rules_errors"] == 1 and rows_of(tmp_path, done)[0]["read"] is None
+
+
+def test_a_threaded_session_outlives_a_reader_that_always_raises(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(session, "RATE_HZ", 200.0)
+    monkeypatch.setattr(reader, "read", boom)
+    h = Harness(tmp_path, threaded=True, sleep=time.sleep)
+    h.session.observe(State.IN_MATCH, "playing")
+    for _ in range(500):
+        if h.detector.calls >= 3:
+            break
+        time.sleep(0.01)
+    assert h.detector.calls >= 3
+
+    events = h.session.observe(State.IN_MATCH, "playing")
+    events += h.session.observe(State.RESULTS, "playing")
+    events = drain_for(h, "play_summary", events)
+
+    assert "play_fallback" not in kinds(events)
+    assert dict(events)["play_summary"]["rules_errors"] >= 3
+
+
 # -- the real thread ---------------------------------------------------------------
 
 
@@ -539,6 +764,35 @@ def test_no_module_under_play_reaches_for_an_input_helper() -> None:
                 continue
             for name in names:
                 assert not any(word in name for word in banned), f"{source.name}: {name}"
+
+
+def test_a_whole_session_with_the_rules_sends_no_input(h, monkeypatch) -> None:
+    sent: list[str] = []
+    for name in ("tap", "swipe", "tap_hold", "keyevent", "input_text", "go_home", "_write_touch"):
+        monkeypatch.setattr(capture.adb, name, lambda *a, name=name, **k: sent.append(name))
+    reading_is(monkeypatch, READING)
+    h.detector.boxes = SELF_AND_CUBE
+
+    h.session.observe(State.IN_MATCH, "playing")
+    h.run(ticks=3)
+    events = h.session.observe(State.RESULTS, "playing")
+
+    assert dict(events)["play_summary"]["rule_calls"]["cubes"] == 3
+    assert sent == []
+
+
+def test_the_session_and_the_rules_stay_off_the_stream() -> None:
+    folder = Path(session.__file__).resolve().parent
+    for name in ("session.py", "rules.py"):
+        tree = ast.parse((folder / name).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                imported = [node.module or ""] + [alias.name for alias in node.names]
+            elif isinstance(node, ast.Import):
+                imported = [alias.name for alias in node.names]
+            else:
+                continue
+            assert not any("stream" in word or "scrcpy" in word for word in imported), name
 
 
 def test_importing_the_session_pulls_nothing_heavy() -> None:
