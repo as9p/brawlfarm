@@ -62,7 +62,7 @@ class AlertStore:
                 ts=ts or datetime.now().isoformat(timespec="seconds"),
                 instance=instance,
                 kind=kind,
-                title=notify.alert_title(kind),
+                title=notify.alert_title(kind, fields),
                 detail=", ".join(f"{k}={v}" for k, v in fields.items() if v is not None),
             )
             self._next_id += 1

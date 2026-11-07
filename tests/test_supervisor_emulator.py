@@ -4,6 +4,7 @@ a real process, because a live farm can be running on the same machine."""
 
 from __future__ import annotations
 
+import ctypes
 import math
 import subprocess
 import sys
@@ -195,6 +196,14 @@ def test_commit_free_gb_fails_open_when_the_read_fails() -> None:
     assert E.commit_free_gb(read=lambda: None) == math.inf
 
 
+@pytest.mark.parametrize("error", [OSError("no"), ValueError("no"), RuntimeError("no")])
+def test_commit_free_gb_fails_open_when_the_read_raises(error) -> None:
+    def read():
+        raise error
+
+    assert E.commit_free_gb(read=read) == math.inf
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="kernel32")
 def test_avail_page_file_takes_the_commit_field_not_physical(monkeypatch) -> None:
     calls: list[int] = []
@@ -276,6 +285,18 @@ def test_close_player_reports_a_terminate_it_could_not_deliver(table) -> None:
     add(table, player(1, "Pie64", terminate_error=psutil.AccessDenied(1)))
     lines: list[str] = []
     assert E.close_player(1, 0.0, post_close=lambda pid: None, log=lines.append) is False
+    assert "failed" in lines[-1]
+
+
+@pytest.mark.parametrize("error", [OSError("no"), ctypes.ArgumentError("no"), ValueError("no")])
+def test_close_player_reports_a_polite_ask_that_raised(table, error) -> None:
+    add(table, player(1, "Pie64"))
+    lines: list[str] = []
+
+    def post_close(pid):
+        raise error
+
+    assert E.close_player(1, 0.0, post_close=post_close, log=lines.append) is False
     assert "failed" in lines[-1]
 
 

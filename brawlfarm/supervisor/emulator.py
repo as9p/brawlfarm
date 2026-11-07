@@ -128,7 +128,10 @@ def commit_free_gb(read: Callable[[], int | None] = _avail_page_file) -> float:
     This is the figure that runs out: free physical memory stayed near 5.6 GB while commit
     was exhausted, so psutil.virtual_memory() would never have seen it. Fails OPEN (inf) on
     a failed read, so a broken probe can never restart a healthy emulator."""
-    available = read()
+    try:
+        available = read()
+    except Exception:
+        return math.inf
     return math.inf if available is None else available / _GB
 
 
@@ -183,7 +186,7 @@ def close_player(
         proc.terminate()  # this Process object refuses a PID that was reused meanwhile
     except psutil.NoSuchProcess:
         return True
-    except (psutil.Error, ValueError) as exc:
+    except (psutil.Error, OSError, ValueError, ctypes.ArgumentError) as exc:
         log(f"close {pid}: failed: {exc}")
         return False
     return True
