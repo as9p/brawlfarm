@@ -957,6 +957,18 @@ def _job_data(tmp_path: Path) -> dict:
     return json.loads(_job_file(tmp_path).read_text(encoding="utf-8"))
 
 
+def _last_data(tmp_path: Path) -> dict:
+    path = S.instance_dir(tmp_path, "Pie64") / L.RECYCLE_LAST_FILE
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _age_job(tmp_path: Path, world: World, seconds: float) -> None:
+    """Rewrite the saved job as ``seconds`` old, as if the supervisor had been down that long."""
+    data = _job_data(tmp_path)
+    data["since"] = (world.now - timedelta(seconds=seconds)).isoformat()
+    _job_file(tmp_path).write_text(json.dumps(data), encoding="utf-8")
+
+
 def _count_probes(sup: Supervisor) -> list:
     probes: list = []
     sup._probe = lambda *args, **kwargs: probes.append(args) or True
@@ -1019,14 +1031,15 @@ def test_resume_never_opens_a_second_player_over_a_crash_after_the_open(tmp_path
 
 
 def test_resume_gives_a_boot_a_full_window(tmp_path, world, monkeypatch) -> None:
-    """The boot clock does not fail a job for the hours nobody was watching."""
+    """The boot clock does not fail a job for the minutes nobody was watching."""
     sup = _guarded(tmp_path, world)
     world.booted = False
     _to_phase(sup, world, "booting")
 
     fresh = _reboot(tmp_path, world)
     pushed, _panel = _capture_alerts(fresh, monkeypatch)
-    assert _next(fresh, world, 3600).desired_reason == "emulator_recycle"
+    # 360 s since the saved time: a full boot window gone, and still young enough to resume
+    assert _next(fresh, world, 300).desired_reason == "emulator_recycle"
     for _ in range(5):  # 300 s from the resume
         assert _next(fresh, world).desired_reason == "emulator_recycle"
     assert pushed == []
@@ -1089,6 +1102,125 @@ def test_a_stop_after_the_restart_abandons_a_resumed_stopping_job(tmp_path, worl
     assert _next(fresh, world).desired_reason == "override_stop"
     assert world.closes == []
     assert not _job_file(tmp_path).exists()
+
+
+_RESUME_LIMIT_S = L.BOOT_TIMEOUT_S + L.SETTLE_S
+
+
+@pytest.mark.parametrize("age_s", [_RESUME_LIMIT_S + 1, 6 * 3600])
+@pytest.mark.parametrize("phase", ["closing", "closed", "booting", "settling"])
+def test_a_stale_job_is_dropped_and_never_reopens(
+    tmp_path, world, monkeypatch, caplog, phase, age_s
+) -> None:
+    """A power cut: HD-Player went with everything else and the job is left over."""
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, phase)
+    world.players.clear()
+    opens = len(world.opens)
+    last = _last_data(tmp_path)
+    _age_job(tmp_path, world, age_s)
+
+    fresh = _reboot(tmp_path, world)
+    pushed, panel = _capture_alerts(fresh, monkeypatch)
+    with caplog.at_level("WARNING", logger="brawlfarm.supervisor"):
+        view = _next(fresh, world, 0)
+    assert "too old to resume" in caplog.text
+    assert view.desired_reason != "emulator_recycle"
+    assert "Pie64" not in fresh._recycling
+    assert not _job_file(tmp_path).exists()
+    assert _last_data(tmp_path) == last
+
+    assert [n for _, _, n in world.launches] == ["Pie64"]  # the normal path took over
+    for _ in range(3):
+        _next(fresh, world)
+    assert len(world.opens) == opens
+    assert pushed == [] and panel == []
+
+
+@pytest.mark.parametrize("phase", ["closing", "closed", "booting", "settling"])
+def test_a_stop_wins_over_a_resumed_job(tmp_path, world, monkeypatch, caplog, phase) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, phase)
+    opens, closes = len(world.opens), len(world.closes)
+    players = dict(world.players)
+    last = _last_data(tmp_path)
+
+    fresh = _reboot(tmp_path, world)
+    fresh.stop("Pie64")
+    pushed, panel = _capture_alerts(fresh, monkeypatch)
+    with caplog.at_level("WARNING", logger="brawlfarm.supervisor"):
+        for _ in range(4):
+            view = _next(fresh, world)
+            assert view.state == InstanceState.STOPPED
+            assert view.desired_reason == "override_stop"
+    assert "a stop is wanted" in caplog.text
+    assert "Pie64" not in fresh._recycling
+    assert not _job_file(tmp_path).exists()
+    assert _last_data(tmp_path) == last
+    assert len(world.opens) == opens and len(world.closes) == closes
+    assert world.players == players  # left as it is, closed or open
+    assert world.launches == []
+    assert pushed == [] and panel == []
+
+
+@pytest.mark.parametrize("phase", ["closing", "closed", "booting", "settling"])
+def test_a_job_at_the_age_limit_with_want_run_still_resumes(tmp_path, world, phase) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, phase)
+    world.players.clear()
+    opens = len(world.opens)
+    last = _last_data(tmp_path)
+    _age_job(tmp_path, world, _RESUME_LIMIT_S)
+
+    fresh = _reboot(tmp_path, world)
+    assert _next(fresh, world, 0).desired_reason == "emulator_recycle"
+    assert len(world.opens) == opens + 1
+    assert fresh._recycling["Pie64"].phase == L._Phase.BOOTING
+    assert _job_file(tmp_path).exists()
+    assert _last_data(tmp_path) == last
+
+
+def test_a_dropped_job_keeps_the_thirty_minute_limit(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, "settling")
+    _age_job(tmp_path, world, _RESUME_LIMIT_S + 1)
+
+    fresh = _reboot(tmp_path, world)
+    _next(fresh, world, 0)
+    assert not _job_file(tmp_path).exists()
+    worker = world.procs[-1].pid
+
+    world.now += timedelta(seconds=60)
+    _heartbeat(tmp_path, "Pie64", worker, world.now)
+    assert _view(fresh.tick(), "Pie64").desired_reason != "emulator_recycle"  # 41 GB, too soon
+
+    world.now = T0 + timedelta(seconds=L.MIN_INTERVAL_S)
+    _heartbeat(tmp_path, "Pie64", worker, world.now)
+    assert _view(fresh.tick(), "Pie64").desired_reason == "emulator_recycle"
+
+
+def test_a_stale_stopping_job_keeps_resuming(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    sup.tick()
+    _age_job(tmp_path, world, 6 * 3600)
+
+    fresh = _reboot(tmp_path, world)
+    world.alive.discard(WORKER)
+    assert _next(fresh, world).desired_reason == "emulator_recycle"
+    assert len(world.closes) == 1
+
+
+def test_a_stale_failed_job_stays_failed(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.open_ok = False
+    _to_phase(sup, world, "booting")
+    world.open_ok = True
+    _age_job(tmp_path, world, 6 * 3600)
+
+    fresh = _reboot(tmp_path, world)
+    assert _next(fresh, world).desired_reason == "emulator_recycle_failed"
+    assert _job_file(tmp_path).exists()
 
 
 def test_failed_survives_a_restart_until_start(tmp_path, world, monkeypatch) -> None:

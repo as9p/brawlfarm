@@ -460,8 +460,8 @@ class Supervisor:
         job = self._recycling.get(name)
         if job is None:
             return self._recycle_trigger(name, now) if want == "run" and alive else None
-        if job.resumed:
-            self._recycle_resume(name, job, now)
+        if job.resumed and not self._recycle_resume(name, job, now, want):
+            return None
         if job.phase == _Phase.STOPPING:
             if want == "stop":  # nothing is closed yet, so the wanted stop just carries on
                 self._recycle_end(name)
@@ -633,21 +633,31 @@ class Supervisor:
         if job is not None:
             self._recycling[name] = job
 
-    def _recycle_resume(self, name: str, job: _Recycle, now: datetime) -> None:
-        """The first step after a supervisor restart. STOPPING and FAILED carry on as they
-        were. Past that nobody was watching, so HD-Player itself says where the job stands:
-        not listed means closed or dead, and the boot step opens it. Listed in BOOTING means
-        it was opened, and it gets a full boot window from here rather than failing for the
-        time nobody checked. CLOSING goes on confirming and SETTLING keeps its clock."""
+    def _recycle_resume(self, name: str, job: _Recycle, now: datetime, want: str) -> bool:
+        """The first step after a supervisor restart; False when it dropped the job. STOPPING
+        and FAILED carry on as they were. Past that the job is dropped if a stop is wanted or
+        it is too old to belong to the same run, say after a power cut: the emulator stays as
+        it is and the tick runs as normal, and RECYCLE_LAST_FILE keeps the interval limit.
+        Otherwise nobody was watching, so HD-Player itself says where the job stands: not
+        listed means closed or dead, and the boot step opens it. Listed in BOOTING means it
+        was opened, and it gets a full boot window from here rather than failing for the time
+        nobody checked. CLOSING goes on confirming and SETTLING keeps its clock."""
         job.resumed = False
         if job.phase in (_Phase.STOPPING, _Phase.FAILED):
-            return
+            return True
+        stale = (now - job.since).total_seconds() > BOOT_TIMEOUT_S + SETTLE_S
+        if want == "stop" or stale:
+            self._recycle_end(name)
+            why = "a stop is wanted" if want == "stop" else "too old to resume"
+            self._log_recycle(name, f"dropped while {job.phase}, {why}", logging.WARNING)
+            return False
         self._log_recycle(name, f"resumed while {job.phase}")
         if self._find_player(name) is None:
             job.phase, job.since, job.opened = _Phase.BOOTING, now, False
             self._recycle_save(name, job)
         elif job.phase == _Phase.BOOTING:
             job.since, job.opened = now, True
+        return True
 
     def _recycle_prune(self) -> None:
         """Forget instances no longer in the settings, whether they left just now or while
