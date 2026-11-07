@@ -139,6 +139,9 @@ export function makeSettings(overrides: Partial<AppSettings> = {}): AppSettings 
       close_game_on_stop: true,
       dnd_at_start: true,
       shadow: false,
+      emulator_recycle_gb: 0,
+      commit_floor_gb: 0,
+      emulator_path: "C:\\Program Files\\BlueStacks_nxt\\HD-Player.exe",
     },
     advanced: {
       fast_input: true,

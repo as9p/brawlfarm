@@ -20,6 +20,7 @@ INSTANCE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}\Z")
 # The game's tag alphabet: no vowels, no 1/3/4/5/6/7, so tags never spell words.
 PLAYER_TAG_RE = re.compile(r"^#[0289PYLQGRJCUV]{3,}\Z")
 DEFAULT_ADB_PATH = r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe"
+DEFAULT_EMULATOR_PATH = r"C:\Program Files\BlueStacks_nxt\HD-Player.exe"
 CONFIG_NAME = "config.toml"
 
 
@@ -49,6 +50,10 @@ class BehaviorSection(_Section):
     close_game_on_stop: bool = True
     dnd_at_start: bool = True
     shadow: bool = False  # play mode's detector runs beside the farm loop and logs; sends no input
+    # HD-Player leaks memory, so the supervisor restarts it. 0 turns a limit off.
+    emulator_recycle_gb: float = Field(default=0.0, ge=0)  # its private memory, above this
+    commit_floor_gb: float = Field(default=0.0, ge=0)  # free commit charge, below this
+    emulator_path: str = DEFAULT_EMULATOR_PATH
 
 
 class AdvancedSection(_Section):

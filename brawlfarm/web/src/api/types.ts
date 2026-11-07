@@ -264,6 +264,9 @@ export interface AppSettings {
     close_game_on_stop: boolean;
     dnd_at_start: boolean;
     shadow: boolean;
+    emulator_recycle_gb: number;
+    commit_floor_gb: number;
+    emulator_path: string;
   };
   advanced: {
     fast_input: boolean;
