@@ -72,3 +72,16 @@ Turning recordings and video into a labelled training set for the play mode dete
 ## Settings
 
 Settings live in `%LOCALAPPDATA%\brawlfarm\config.toml` (override the folder with `BRAWLFARM_HOME`). Add one `[[instances]]` table per BlueStacks instance with its `name` and `adb_port`; each instance's files live under `instances/<name>/`. Stopping the process leaves workers running; the next start reattaches to them through their status files.
+
+### Emulator restarts
+
+BlueStacks' HD-Player leaks memory under the farm, so the supervisor can restart it between matches. Two settings under `[behavior]`, both off by default (0):
+
+- `emulator_recycle_gb`: restart when HD-Player's private memory reaches this many GB.
+- `commit_floor_gb`: restart when free commit charge drops below this many GB, but only if HD-Player itself holds at least 8 GB, because a restart cannot help when other programs hold the memory.
+
+The check is commit and not free physical memory because commit is what runs out. Windows refuses allocations once the commit limit is reached, and that has happened with about 5.6 GB of physical memory still free, so a physical memory check would never have seen it.
+
+The checks run only while a worker is running and the instance is wanted running. A restart lets the worker finish its match, closes HD-Player, reopens it from `emulator_path`, waits up to 6 minutes for Android to boot, then 2 minutes more before the worker starts. The instance reads as a scheduled break, reason `emulator_recycle`, and restarts at most once per 30 minutes. If a step fails you get one alert and the instance stays stopped, reason `emulator_recycle_failed`, until you press Start. Stopping an instance during a restart wins: it finishes closing or booting, then stays stopped. Restart progress lives in memory, so closing brawlfarm mid-restart can leave the emulator closed until you open it.
+
+The panel has no field for these yet. Set them in `config.toml` or through `PUT /api/settings`.

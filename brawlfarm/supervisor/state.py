@@ -8,6 +8,7 @@ from datetime import datetime
 from enum import StrEnum
 
 STALE_S = 240.0  # heartbeat older than this while the PID is alive = stale
+RECYCLE_FAILED_REASON = "emulator_recycle_failed"  # stays down until start(), never resumes
 _TS_FMT = "%Y-%m-%dT%H:%M:%S"
 
 
@@ -106,6 +107,6 @@ def derive_state(
         return InstanceState.OFFLINE, offline_until
     if booting or desired in ("run", "observe"):
         return InstanceState.STARTING, None
-    if desired_reason == "override_stop":
+    if desired_reason in ("override_stop", RECYCLE_FAILED_REASON):
         return InstanceState.STOPPED, None
     return InstanceState.SCHEDULED_BREAK, desired_until

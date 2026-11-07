@@ -6,6 +6,9 @@ classify the heartbeat, read the scheduler's desired state, and act: desired sto
 alive -> write stop.flag, kill by PID after STOP_ESCALATE_S; desired run and unhealthy
 -> probe adb (offline backoff), kill a stale PID, launch (one launch per tick).
 Everything the panel shows is derived here once per tick into InstanceView objects.
+
+The emulator guard runs first in each instance's tick: when HD-Player has leaked past its
+limits it holds the instance on the stop path and restarts HD-Player, one step per tick.
 """
 
 from __future__ import annotations
@@ -16,14 +19,17 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 
 from brawlfarm import settings as S
 from brawlfarm.core import config, events, notify, scheduler, status
-from brawlfarm.supervisor import process
+from brawlfarm.supervisor import emulator, process
 from brawlfarm.supervisor.backoff import OfflineBackoff
 from brawlfarm.supervisor.state import (
+    RECYCLE_FAILED_REASON,
     Health,
     InstanceState,
     InstanceView,
@@ -40,6 +46,41 @@ STOP_ESCALATE_S = 110.0  # graceful stop.flag first, kill by PID after this
 ALERT_AFTER_MISSES = 3
 STOP_OVERRIDE_DAYS = 365  # "stopped until you start it again"
 STOP_FLAG = "stop.flag"
+MIN_RECYCLE_GB = 8.0  # a commit trigger needs HD-Player itself to hold this much
+MIN_INTERVAL_S = 1800.0  # one emulator restart per instance, from the last one's start
+CLOSE_GRACE_S = 20.0  # for the window to close before HD-Player is terminated
+CLOSE_CONFIRM_TICKS = 3  # ticks HD-Player may still be listed after the close
+BOOT_TIMEOUT_S = 360.0  # from the open to sys.boot_completed
+SETTLE_S = 120.0  # after boot, before the worker: the stagger rule
+RECYCLE_REASON = "emulator_recycle"
+
+
+class _Phase(StrEnum):
+    STOPPING = "stopping"
+    CLOSING = "closing"
+    BOOTING = "booting"
+    SETTLING = "settling"
+    FAILED = "failed"
+
+
+_PHASE_NOTES = {
+    _Phase.STOPPING: "Restarting the emulator after this match",
+    _Phase.CLOSING: "Restarting the emulator: closing it",
+    _Phase.BOOTING: "Restarting the emulator: waiting for it to boot",
+    _Phase.SETTLING: "Restarting the emulator: letting it settle",
+    _Phase.FAILED: "Emulator restart failed; stopped until you start it again",
+}
+
+
+@dataclass
+class _Recycle:
+    """One instance's emulator restart. In memory only: the tick advances it a step at a
+    time and never sleeps, and a supervisor restart forgets it."""
+
+    phase: _Phase
+    since: datetime  # when this phase began; in BOOTING, when HD-Player was opened
+    still_listed: int = 0  # ticks find_player has still seen HD-Player since the close
+    opened: bool = False
 
 
 class Supervisor:
@@ -57,6 +98,12 @@ class Supervisor:
         events_refresh: Callable[..., int] = events.refresh,
         pinger: Callable[[], bool] = notify.ping_healthchecks,
         interval_s: float = TICK_S,
+        find_player: Callable[[str], int | None] = emulator.find_player,
+        private_gb: Callable[[int], float | None] = emulator.private_gb,
+        commit_free_gb: Callable[[], float] = emulator.commit_free_gb,
+        close_player: Callable[..., bool] = emulator.close_player,
+        open_player: Callable[..., int | None] = emulator.open_player,
+        boot_done: Callable[..., bool] = emulator.boot_done,
     ) -> None:
         self.settings = settings
         self.home = Path(home).resolve()
@@ -64,6 +111,15 @@ class Supervisor:
         self._clock, self._probe, self._launch = clock, probe, launcher
         self._alive, self._kill, self._sleep, self._refresh = alive, killer, sleep, events_refresh
         self._ping = pinger
+        self._find_player, self._private_gb = find_player, private_gb
+        self._commit_free_gb = commit_free_gb
+        self._close_player, self._open_player, self._boot_done = (
+            close_player,
+            open_player,
+            boot_done,
+        )
+        self._recycling: dict[str, _Recycle] = {}
+        self._recycled_at: dict[str, datetime] = {}
         self._backoff = OfflineBackoff()
         self._stop_asked: dict[str, datetime] = {}
         self._launched_at: dict[str, datetime] = {}
@@ -91,6 +147,9 @@ class Supervisor:
             "BRAWL_API_TOKEN", ""
         )
         scheduler.set_default_enabled(settings.scheduler.default_enabled)
+        self._recycle_gb = settings.behavior.emulator_recycle_gb
+        self._commit_floor_gb = settings.behavior.commit_floor_gb
+        self._emulator_path = settings.behavior.emulator_path
         n = settings.notifications
         notify.configure(
             webhook_url=n.webhook_url or None,  # blank defers to the environment
@@ -185,6 +244,16 @@ class Supervisor:
         until = _parse_until((desired or {}).get("until"))
         note = ""
         launched = False
+        # A restart in flight is a stop as far as this tick goes: the stop branch below does
+        # the graceful stop and its escalation, and it is also what keeps the probe away, so
+        # the closed emulator is neither offline nor a backoff miss, and nothing launches.
+        # A stop that was already wanted keeps its own reason and outlives the restart.
+        job = self._recycle_step(inst, now, want, alive)
+        if job is not None:
+            note = _PHASE_NOTES[job.phase]
+            if job.phase == _Phase.FAILED or want != "stop":
+                reason = RECYCLE_FAILED_REASON if job.phase == _Phase.FAILED else RECYCLE_REASON
+                want, until = "stop", None
         # One worker per instance means the live one has to be the right kind: the farm
         # controller writes no "mode", the observer writes "observe". A live worker whose
         # kind no longer matches what is wanted is stopped like any other stop, and the
@@ -351,6 +420,107 @@ class Supervisor:
             "%s: launched worker pid %s (%s)", inst.name, getattr(proc, "pid", "?"), " ".join(args)
         )
 
+    # --- the emulator guard -----------------------------------------------------------
+
+    def _recycle_step(
+        self, inst: S.InstanceSettings, now: datetime, want: str, alive: bool
+    ) -> _Recycle | None:
+        """Advance this instance's emulator restart by at most one step. Returns the restart
+        still in flight, or None when there is none and the tick runs as normal."""
+        name = inst.name
+        job = self._recycling.get(name)
+        if job is None:
+            return self._recycle_trigger(name, now) if want == "run" and alive else None
+        if job.phase == _Phase.STOPPING:
+            if want == "stop":  # nothing is closed yet, so the wanted stop just carries on
+                self._recycling.pop(name, None)
+                self._log_recycle(name, "abandoned, a stop was asked for")
+                return None
+            if not alive:
+                self._recycle_close(name, job, now)
+        elif job.phase == _Phase.CLOSING:
+            if self._find_player(name) is None:
+                job.phase, job.since = _Phase.BOOTING, now
+                self._log_recycle(name, "closed")
+            else:
+                job.still_listed += 1
+                if job.still_listed >= CLOSE_CONFIRM_TICKS:
+                    self._recycle_failed(name, job, "closing")
+        elif job.phase == _Phase.BOOTING:
+            self._recycle_boot(inst, job, now)
+        elif job.phase == _Phase.SETTLING and (now - job.since).total_seconds() >= SETTLE_S:
+            self._recycling.pop(name, None)
+            self._log_recycle(name, "done")
+            return None
+        return job
+
+    def _recycle_trigger(self, name: str, now: datetime) -> _Recycle | None:
+        """Start a restart when a limit is crossed. Off unless a limit is set; a commit
+        shortage only counts when HD-Player holds enough that a restart would give it back,
+        and a failed commit read is inf, which crosses nothing."""
+        if self._recycle_gb <= 0 and self._commit_floor_gb <= 0:
+            return None
+        last = self._recycled_at.get(name)
+        if last is not None and (now - last).total_seconds() < MIN_INTERVAL_S:
+            return None
+        player = self._find_player(name)
+        private = None if player is None else self._private_gb(player)
+        if private is None:
+            return None
+        by_memory = 0 < self._recycle_gb <= private
+        by_commit = private >= MIN_RECYCLE_GB and self._commit_free_gb() < self._commit_floor_gb
+        if not (by_memory or by_commit):
+            return None
+        job = self._recycling[name] = _Recycle(_Phase.STOPPING, now)
+        self._recycled_at[name] = now
+        self._log_recycle(name, f"stopping ({'memory' if by_memory else 'commit'} limit)")
+        return job
+
+    def _recycle_close(self, name: str, job: _Recycle, now: datetime) -> None:
+        """The worker has exited. close_player() does not wait out a terminate, so the phase
+        moves on to confirm the close on later ticks. Already gone is just confirmed."""
+        self._log_recycle(name, "closing")
+        player = self._find_player(name)
+        if player is None or self._close_player(player, grace_s=CLOSE_GRACE_S, log=log.warning):
+            job.phase, job.since = _Phase.CLOSING, now
+        else:
+            self._recycle_failed(name, job, "closing")
+
+    def _recycle_boot(self, inst: S.InstanceSettings, job: _Recycle, now: datetime) -> None:
+        name = inst.name
+        if not job.opened:
+            if self._open_player(self._emulator_path, name, log=log.warning) is None:
+                self._recycle_failed(name, job, "opening")
+                return
+            job.opened, job.since = True, now
+            self._log_recycle(name, "booting")
+        elif self._boot_done(self.settings.connection.adb_path, inst.adb_port):
+            job.phase, job.since = _Phase.SETTLING, now
+            self._log_recycle(name, "settling")
+        elif (now - job.since).total_seconds() >= BOOT_TIMEOUT_S:
+            self._recycle_failed(name, job, "booting")
+
+    def _recycle_failed(self, name: str, job: _Recycle, step: str) -> None:
+        """The one alert for this restart. "offline" because that is the kind the default
+        notification events carry; the fields say why."""
+        job.phase = _Phase.FAILED
+        self._log_recycle(name, f"failed while {step}", logging.ERROR)
+        fields = {"reason": RECYCLE_FAILED_REASON, "step": step}
+        notify.maybe_alert("offline", {"instance": name, **fields})
+        self._fire_alert(name, "offline", fields)
+
+    def _log_recycle(self, name: str, step: str, level: int = logging.INFO) -> None:
+        player = self._find_player(name)
+        private = None if player is None else self._private_gb(player)
+        log.log(
+            level,
+            "%s: emulator recycle %s (HD-Player private %s, commit free %.1f GB)",
+            name,
+            step,
+            "n/a" if private is None else f"{private:.1f} GB",
+            self._commit_free_gb(),
+        )
+
     # --- controls (called from the event loop thread; phase 3 wires them to the API) ---
 
     def start(self, name: str, hours: float | None = None) -> None:
@@ -364,6 +534,9 @@ class Supervisor:
         self._flag(name).unlink(missing_ok=True)
         self._stop_asked.pop(name, None)
         self._backoff.clear(name)
+        job = self._recycling.get(name)
+        if job is not None and job.phase == _Phase.FAILED:
+            self._recycling.pop(name, None)
         self.poke()
 
     def stop(self, name: str) -> None:
