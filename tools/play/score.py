@@ -24,6 +24,11 @@ Three tap anchors have no template behind them (skull_star, team_up_panel, event
 nothing here can tell a good detection of one from a bad one, or count one as missed. Those are
 listed as having no label source and decide nothing; they are for the owner to look at.
 
+The in-match classes have no template either, but the test split has labels for them, so they
+are reported against those labels, apart for live captures and for YouTube: one group of frames
+can outweigh the other, and a number for both together says little about either. A class in a
+group with fewer than --min-truth labelled boxes says so. None of this decides the verdict.
+
     uv run python tools/play/score.py
     uv run python tools/play/score.py --cuda --min-truth 50
     uv run python tools/play/score.py --frames D:/shots
@@ -43,7 +48,7 @@ import onnxruntime as ort
 
 from brawlfarm import settings
 from brawlfarm.core import vision
-from tools.play import classes, dataset, prelabel, thresholds
+from tools.play import classes, coco, dataset, export, prelabel, thresholds
 
 SUFFIXES = frozenset({".jpg", ".jpeg", ".png"})
 PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
@@ -56,6 +61,9 @@ MIN_RECALL = 0.5
 LABELLED: frozenset[str] = classes.TAP_ANCHORS & set(classes.TEMPLATE_CLASS.values())
 # tap anchors the templates cannot judge: a detection of one is reported, never counted
 UNVERIFIABLE: frozenset[str] = classes.TAP_ANCHORS - set(classes.TEMPLATE_CLASS.values())
+# what a match shows: measured on the labels of the test split, and never part of the verdict
+IN_MATCH: tuple[str, ...] = tuple(cls for cls in classes.CLASSES if cls not in classes.TAP_ANCHORS)
+LIVE, YOUTUBE = "live", "youtube"
 CUDA = "CUDAExecutionProvider"
 SCAN = "a folder scan, not the held-out test split: the model may have trained on these frames"
 
@@ -235,6 +243,59 @@ def report(
     }
 
 
+def source_group(file_name: str) -> str:
+    """Which group a test frame belongs to, YOUTUBE or LIVE, from its file name alone.
+
+    coco.py keeps the name a frame had under `frames/<source>/` and drops the folder. A video's
+    frames are saved as `<source>-<number>.jpg`, so its source is still at the front of the name.
+    """
+    return YOUTUBE if file_name.startswith(coco.YOUTUBE_PREFIX) else LIVE
+
+
+def tally(detections: list[dict], labels: list[dict]) -> dict[str, Counter[str]]:
+    """tp, fp and fn per in-match class for one frame, box by box.
+
+    The boxes are matched the way export.py matches them when it picks a threshold, so a number
+    here reads the same as the one the threshold was picked on.
+    """
+    counts = {}
+    for cls in IN_MATCH:
+        here = [box for box in detections if box["class"] == cls]
+        index = classes.category_id(cls) - 1
+        truth = [box for box in labels if box["class_index"] == index]
+        tp = sum(thresholds.match_detections(here, truth))
+        counts[cls] = Counter(tp=tp, fp=len(here) - tp, fn=len(truth) - tp)
+    return counts
+
+
+def by_source(groups: dict[str, list[dict]], *, min_truth: int = MIN_TRUTH) -> dict:
+    """The tally of every frame summed per class within each group of frames.
+
+    A precision or a recall with nothing under it is 0.0, as in report. A class with fewer than
+    min_truth labelled boxes in a group is marked as too thin to read there, which is the same
+    bar report holds a tap anchor to, and that mark is all it costs: nothing here reaches the
+    verdict.
+    """
+    sources = {}
+    for group, rows in groups.items():
+        per_class = {}
+        for cls in IN_MATCH:
+            tp = sum(row[cls]["tp"] for row in rows)
+            fp = sum(row[cls]["fp"] for row in rows)
+            fn = sum(row[cls]["fn"] for row in rows)
+            per_class[cls] = {
+                "truth": tp + fn,
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "precision": round(tp / (tp + fp), 4) if tp + fp else 0.0,
+                "recall": round(tp / (tp + fn), 4) if tp + fn else 0.0,
+                "enough_truth": tp + fn >= min_truth,
+            }
+        sources[group] = {"frames": len(rows), "classes": per_class}
+    return sources
+
+
 def held_out(root: Path, meta: dict) -> tuple[list[tuple[str, Path]], list[str]]:
     """The test split of the COCO build as (name, path) pairs, and why it cannot prove a pass.
 
@@ -275,6 +336,12 @@ def scanned(folders: list[Path]) -> tuple[list[tuple[str, Path]], list[str]]:
     return pictures, caveats
 
 
+def held_out_labels(root: Path) -> dict[str, list[dict]]:
+    """The labelled boxes of the test split per file name, in the class numbering of the model."""
+    _names, truth = export.read_coco(root / "coco" / "test" / "_annotations.coco.json")
+    return truth
+
+
 def truth_bar(text: str) -> int:
     """An argparse type for a truth minimum: a whole number, at least 1."""
     try:
@@ -304,6 +371,22 @@ def _read_frame(path: Path) -> np.ndarray | None:
 
 def _pictures(folder: Path) -> list[Path]:
     return sorted(path for path in folder.rglob("*") if path.suffix.lower() in SUFFIXES)
+
+
+def _print_sources(sources: dict, min_truth: int) -> None:
+    print("in-match classes by frame source, on the test split's labels; these decide nothing")
+    head = f"{'source':<8} {'class':<18} {'truth':>5} {'tp':>5} {'fp':>5} {'fn':>5}"
+    print(f"  {head} {'prec':>6} {'rec':>6}")
+    for group, source in sources.items():
+        if not source["frames"]:
+            print(f"  {group:<8} no frames scored")
+            continue
+        for cls, count in source["classes"].items():
+            thin = "" if count["enough_truth"] else f" too little truth, under {min_truth}"
+            print(
+                f"  {group:<8} {cls:<18} {count['truth']:>5} {count['tp']:>5} {count['fp']:>5} "
+                f"{count['fn']:>5} {count['precision']:>6.3f} {count['recall']:>6.3f}{thin}"
+            )
 
 
 def main(argv: list[str] | None = None, *, find=vision.find_with_score) -> int:
@@ -359,12 +442,15 @@ def main(argv: list[str] | None = None, *, find=vision.find_with_score) -> int:
         pictures, caveats = scanned([root / "frames", recordings])
     else:
         pictures, caveats = held_out(root, meta)
+    # A folder scan has no labels, and with no COCO build there are no frames to label.
+    labels = held_out_labels(root) if pictures and not scan else None
     if meta["smoke"]:
         caveats.append("the model was trained on a smoke set, so the report means nothing")
 
     rows: list[dict] = []
     failures: list[dict] = []
     unverified: list[dict] = []
+    groups: dict[str, list[dict]] = {LIVE: [], YOUTUBE: []}
     scored = skipped = 0
     for name, path in pictures:
         frame = _read_frame(path) if path.is_file() else None
@@ -379,6 +465,8 @@ def main(argv: list[str] | None = None, *, find=vision.find_with_score) -> int:
         found = detect(sess, meta, frame)
         verdicts = compare(found, template_truth(frame, find=find))
         rows.append(verdicts)
+        if labels is not None:
+            groups[source_group(name)].append(tally(found, labels[name]))
         failures.extend(
             {"file": name, "class": cls}
             for cls, verdict in sorted(verdicts.items())
@@ -399,6 +487,7 @@ def main(argv: list[str] | None = None, *, find=vision.find_with_score) -> int:
         "frames": {"scored": scored, "skipped": skipped},
         "tap_anchor_failures": failures,
         "unverified_tap_anchor_detections": unverified,
+        "sources": by_source(groups, min_truth=args.min_truth) if labels is not None else None,
     }
     models.mkdir(parents=True, exist_ok=True)
     (models / "score.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
@@ -415,6 +504,10 @@ def main(argv: list[str] | None = None, *, find=vision.find_with_score) -> int:
                 f"{count['fn']:>5} {count['tn']:>5} {count['precision']:>6.3f} "
                 f"{count['recall']:>6.3f}{anchor}"
             )
+    if summary["sources"] is not None:
+        _print_sources(summary["sources"], args.min_truth)
+    elif scan:
+        print("no in-match numbers by frame source: a folder scan has no labels")
     for bad in failures:
         print(f"  never-tap failure: {bad['class']} on {bad['file']}, the templates see none there")
     print(
