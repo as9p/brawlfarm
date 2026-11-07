@@ -215,7 +215,7 @@ class Controller:
         self._gallery_rounds = 0  # forced-gallery cannon taps this session, never reset
         self._playing_modal_i = 0  # in-match iteration counter for the modal scan
         self._dismiss_tried = False  # recover() soft dismiss-ladder used this cycle
-        self._update_checked = False  # game auto-update store check used this run (never reset)
+        self._update_checked = False  # game auto-update check used this run (unreadable: reset)
 
     # --- small helpers -------------------------------------------------------
 
@@ -1530,6 +1530,8 @@ class Controller:
         # Game auto-update (2026-11-04): a new client opens to an update prompt that no
         # relaunch fixes. On the SECOND recovery of the run (the first relaunch did not
         # help), check the Play Store once. A failed update has already stopped the run.
+        # An unreadable version does not use up the check, but the attempt gate still
+        # allows one try per cycle: a retry needs the menu to reset recovery_attempts.
         if (
             self.recovery_attempts == config.GAME_UPDATE_ON_ATTEMPT
             and not self._update_checked
@@ -1579,6 +1581,8 @@ class Controller:
             return True
         if out.result is game_update.UpdateResult.NO_UPDATE:
             self.dl.event("update_check", result="none", reason=out.reason)
+            if out.reason == "version_unreadable":
+                self._update_checked = False  # settled nothing: a later cycle may check
             return True
         try:
             self.event_shot(adb.screencap(), "update_failed")

@@ -93,10 +93,10 @@ def test_store_leaves_foreground_before_tap_fails_without_tapping() -> None:
     assert calls == ["open"]
 
 
-def test_unreadable_version_fails_before_opening_store() -> None:
+def test_unreadable_version_is_inconclusive_before_opening_store() -> None:
     fx, calls, _ = _fx(versions=(None,))
     out = game_update.try_update(fx)
-    assert out.result is UpdateResult.FAILED
+    assert out.result is UpdateResult.NO_UPDATE
     assert out.reason == "version_unreadable"
     assert calls == []
 
