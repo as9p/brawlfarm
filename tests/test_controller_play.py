@@ -10,6 +10,7 @@ the object is built without __init__ (no adb, no API, no DataLog), so the inputs
 exactly the config flag and the session stub.
 """
 
+import math
 import subprocess
 import sys
 import time
@@ -17,6 +18,7 @@ import time
 import pytest
 
 from brawlfarm.core import config
+from brawlfarm.core import controller as controller_mod
 from brawlfarm.core.controller import Controller
 from brawlfarm.core.match_vision import BushAction
 from brawlfarm.core.states import State
@@ -120,8 +122,17 @@ def test_the_tick_hands_the_session_the_last_move(monkeypatch) -> None:
     c = _ctrl(play)
     c._last_move_kind = "relocate"
     c.last_move = 12.5
+    c._last_move_heading = 1.5
+    c._last_move_target = (1, 2)
     c._play_observe(State.IN_MATCH)
-    assert play.moves == [{"farm_move": "relocate", "moved_at": 12.5}]
+    assert play.moves == [
+        {
+            "farm_move": "relocate",
+            "moved_at": 12.5,
+            "farm_heading": 1.5,
+            "farm_target": (1, 2),
+        }
+    ]
     assert c._play_off is False
 
 
@@ -130,7 +141,9 @@ def test_the_tick_works_on_a_controller_without_the_move_attributes(monkeypatch)
     play = _Session()
     c = _ctrl(play)  # built without __init__: no last_move, no _last_move_kind
     c._play_observe(State.IN_MATCH)
-    assert play.moves == [{"farm_move": None, "moved_at": None}]
+    assert play.moves == [
+        {"farm_move": None, "moved_at": None, "farm_heading": None, "farm_target": None}
+    ]
     assert c._play_off is False
 
 
@@ -176,6 +189,104 @@ def test_a_tick_with_no_move_due_keeps_the_last_kind(monkeypatch) -> None:
     assert c._last_move_kind == "wander"
 
 
+def _swiper(monkeypatch, action, uniforms=()):
+    """A _mover that runs the real move code down to a stubbed adb.swipe, so a test can hold
+    what the tick recorded against what it swiped. ``uniforms`` scripts random.uniform in call
+    order; past the script it returns its low bound."""
+    c = _mover(monkeypatch, action)
+    del c._steer_to_bush, c._wander_move
+    c._gas_edges = set()
+    c._relocations = 0
+    c._bush_jitter_at = 0.0
+    c._heading = 0.0
+    c.swipes = []
+    values = iter(uniforms)
+    monkeypatch.setattr(controller_mod.random, "uniform", lambda low, high: next(values, low))
+    monkeypatch.setattr(controller_mod.adb, "swipe", lambda *a: c.swipes.append(a))
+    return c
+
+
+def _swiped_heading(swipe) -> float:
+    x1, y1, x2, y2, _duration = swipe
+    return math.atan2(y2 - y1, x2 - x1)
+
+
+def _bush_at(dx, dy):
+    return (config.BUSH_SELF_POS[0] + dx, config.BUSH_SELF_POS[1] + dy)
+
+
+def test_a_wander_records_its_heading_and_no_target(monkeypatch) -> None:
+    c = _swiper(monkeypatch, None, uniforms=[0.5, 1.0, 1.0])
+    c._heading = 1.0
+    c._last_move_target = (9, 9)  # the tick before steered
+    c.phase_playing(None, State.IN_MATCH)
+    assert c._last_move_kind == "wander"
+    assert c._last_move_heading == 1.5
+    assert c._last_move_target is None
+    assert len(c.swipes) == 1
+    assert _swiped_heading(c.swipes[0]) == pytest.approx(1.5, abs=0.02)
+
+
+@pytest.mark.parametrize("kind", ["hide", "relocate"])
+def test_a_steer_records_the_heading_it_swiped_and_the_bush(monkeypatch, kind) -> None:
+    target = _bush_at(-120, 90)
+    c = _swiper(monkeypatch, BushAction(kind, target=target), uniforms=[1.0, 1.0])
+    c.phase_playing(None, State.IN_MATCH)
+    assert c._last_move_kind == kind
+    assert c._last_move_heading == math.atan2(90, -120)
+    assert c._last_move_target == target
+    assert len(c.swipes) == 1
+    assert _swiped_heading(c.swipes[0]) == pytest.approx(c._last_move_heading, abs=0.02)
+
+
+def test_a_relocate_over_the_cap_is_a_wander_with_no_target(monkeypatch) -> None:
+    action = BushAction("relocate", target=_bush_at(50, 50))
+    c = _swiper(monkeypatch, action, uniforms=[0.5, 1.0, 1.0])
+    c._relocations = config.BUSH_MAX_RELOCATIONS
+    c._heading = 1.0
+    c.phase_playing(None, State.IN_MATCH)
+    assert c._last_move_kind == "relocate"
+    assert c._last_move_heading == 1.5
+    assert c._last_move_target is None
+
+
+def test_a_hold_records_the_jitter_it_swiped_not_the_wander_heading(monkeypatch) -> None:
+    target = _bush_at(5, 5)
+    action = BushAction("hide", target=target, at_target=True)
+    # the interval, the jitter's own heading, then its magnitude and duration
+    c = _swiper(monkeypatch, action, uniforms=[0.0, 2.5, 1.0, 1.0])
+    c._heading = 1.0
+    c.phase_playing(None, State.IN_MATCH)
+    assert c._last_move_heading == 2.5
+    assert c._heading == 1.0
+    assert c._last_move_target == target
+    assert len(c.swipes) == 1
+
+
+def test_a_hold_with_no_jitter_due_swiped_nothing(monkeypatch) -> None:
+    """Without the clear, the row would show the last tick's heading for a swipe never sent."""
+    target = _bush_at(5, 5)
+    action = BushAction("hide", target=target, at_target=True)
+    c = _swiper(monkeypatch, action, uniforms=[float("inf")])
+    c._last_move_heading = 1.5
+    c.phase_playing(None, State.IN_MATCH)
+    assert c.swipes == []
+    assert c._last_move_kind == "hide"
+    assert c._last_move_heading is None
+    assert c._last_move_target == target
+
+
+def test_a_tick_with_no_move_due_keeps_the_last_heading_and_target(monkeypatch) -> None:
+    c = _swiper(monkeypatch, None)
+    c._last_move_heading = 1.5
+    c._last_move_target = (1, 2)
+    c._move_gap = float("inf")
+    c.phase_playing(None, State.IN_MATCH)
+    assert c.swipes == []
+    assert c._last_move_heading == 1.5
+    assert c._last_move_target == (1, 2)
+
+
 def test_a_new_match_forgets_the_last_move() -> None:
     """The tick after entry reaches the session before the farm's first move of this match."""
 
@@ -187,8 +298,35 @@ def test_a_new_match_forgets_the_last_move() -> None:
     c.set_phase = lambda name: None
     c._gas = _Gas()
     c._last_move_kind = "hide"
+    c._last_move_heading = 1.5
+    c._last_move_target = (1, 2)
     c._enter_match()
     assert c._last_move_kind is None
+    assert c._last_move_heading is None
+    assert c._last_move_target is None
+
+
+def test_a_rejoin_forgets_the_last_move(monkeypatch) -> None:
+    """It puts last_move back to 0.0, so a kept kind would reach the row with a null age."""
+    monkeypatch.setattr(config, "PLAY_SHADOW", True)
+    monkeypatch.setattr(controller_mod.states, "is_other_device", lambda screen: False)
+    monkeypatch.setattr(controller_mod.vision, "find", lambda *a, **k: None)
+    monkeypatch.setattr(controller_mod.time, "sleep", lambda seconds: None)
+    play = _Session()
+    c = _ctrl(play)
+    c.disconnect_count = 0
+    c.event_shot = lambda screen, name: None
+    c.tap = lambda *a, **k: None
+    c.set_phase = lambda name: None
+    c.last_move = 12.5
+    c._last_move_kind = "hide"
+    c._last_move_heading = 1.5
+    c._last_move_target = (1, 2)
+    c.handle_disconnect(None)
+    c._play_observe(State.IN_MATCH)
+    assert play.moves == [
+        {"farm_move": None, "moved_at": 0.0, "farm_heading": None, "farm_target": None}
+    ]
 
 
 def test_a_raising_session_turns_shadow_off_after_one_line(monkeypatch) -> None:
