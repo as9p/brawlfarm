@@ -48,6 +48,7 @@ log = logging.getLogger("brawlfarm.supervisor")
 TICK_S = 60.0
 BOOT_GRACE_S = 180.0  # after a launch, do not relaunch before the worker can heartbeat
 STOP_ESCALATE_S = 110.0  # graceful stop.flag first, kill by PID after this
+RECYCLE_STOP_GRACE_S = 360.0  # the same, while an emulator restart waits out a match
 ALERT_AFTER_MISSES = 3
 STOP_OVERRIDE_DAYS = 365  # "stopped until you start it again"
 STOP_FLAG = "stop.flag"
@@ -323,7 +324,7 @@ class Supervisor:
                     note = "Worker could not be stopped; will retry next tick"
 
         stop_deadline = (
-            self._stop_asked[name] + timedelta(seconds=STOP_ESCALATE_S)
+            self._stop_asked[name] + timedelta(seconds=self._stop_grace_s(name))
             if name in self._stop_asked and alive
             else None
         )
@@ -404,14 +405,24 @@ class Supervisor:
         self._stop_asked[name] = now
         log.info("%s: stop requested (stop.flag written)", name)
 
+    def _stop_grace_s(self, name: str) -> float:
+        """How long a requested stop waits before the kill. An emulator restart promises to
+        wait for the match, and only that one: a stop wanted meanwhile ends the job first, so
+        it is back on STOP_ESCALATE_S, counted from the original ask."""
+        job = self._recycling.get(name)
+        if job is not None and job.phase == _Phase.STOPPING:
+            return RECYCLE_STOP_GRACE_S
+        return STOP_ESCALATE_S
+
     def _maybe_escalate(self, name: str, pid: int | None, now: datetime) -> bool:
-        """Kill by PID once a requested stop has waited STOP_ESCALATE_S. True when killed."""
+        """Kill by PID once a requested stop has waited its grace. True when killed."""
         asked = self._stop_asked.get(name)
         if asked is None or pid is None:
             return False
-        if (now - asked).total_seconds() < STOP_ESCALATE_S:
+        grace = self._stop_grace_s(name)
+        if (now - asked).total_seconds() < grace:
             return False
-        log.warning("%s: stop not honoured in %ds, killing pid %s", name, STOP_ESCALATE_S, pid)
+        log.warning("%s: stop not honoured in %ds, killing pid %s", name, grace, pid)
         if not self._ensure_gone(name, pid):
             return False  # the deadline stays set, so the next tick escalates again
         self._stop_asked.pop(name, None)

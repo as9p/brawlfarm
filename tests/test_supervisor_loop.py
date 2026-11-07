@@ -693,11 +693,94 @@ def test_stubborn_worker_is_killed_by_the_existing_escalation(tmp_path, world) -
     world.player_gb = 41.0
     sup.tick()
     _heartbeat(tmp_path, "Pie64", WORKER, world.now)
-    _next(sup, world, L.STOP_ESCALATE_S)
+    _next(sup, world, L.RECYCLE_STOP_GRACE_S)
     assert world.kills == [WORKER]
     assert world.closes == []  # the kill was this tick's step
     _next(sup, world)
     assert world.closes == [(PLAYER, 20.0)]
+
+
+def test_a_restart_waits_out_the_match_before_the_kill(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    asked = world.now
+    deadline = asked + timedelta(seconds=L.RECYCLE_STOP_GRACE_S)
+    assert _view(sup.tick(), "Pie64").until == deadline
+
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=111))
+    view = _next(sup, world, 111)  # past STOP_ESCALATE_S, still in its match
+    assert view.state == InstanceState.STOPPING
+    assert view.until == deadline
+    assert world.kills == []
+
+    _heartbeat(tmp_path, "Pie64", WORKER, deadline - timedelta(seconds=1))
+    assert _next(sup, world, L.RECYCLE_STOP_GRACE_S - 112).state == InstanceState.STOPPING
+    assert world.kills == []
+
+    _next(sup, world, 1)
+    assert world.kills == [WORKER]
+    assert world.closes == []
+
+
+def _override_stop(sup: Supervisor, world: World) -> None:
+    scheduler.write_override("Pie64", "stop", world.now + timedelta(days=1))
+
+
+@pytest.mark.parametrize(
+    "ask",
+    [
+        lambda sup, world: sup.stop("Pie64"),
+        _override_stop,
+        lambda sup, world: sup.restart("Pie64"),
+        lambda sup, world: sup.observe("Pie64", True),  # wrong_kind: a farm worker has to go
+    ],
+    ids=["owner_stop", "desired_stop", "restart", "wrong_kind"],
+)
+def test_every_other_stop_keeps_the_ordinary_limit(tmp_path, world, ask) -> None:
+    sup = _guarded(tmp_path, world)
+    asked = world.now
+    ask(sup, world)
+    assert _view(sup.tick(), "Pie64").until == asked + timedelta(seconds=L.STOP_ESCALATE_S)
+
+    world.now = asked + timedelta(seconds=L.STOP_ESCALATE_S - 1)
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+    sup.tick()
+    assert world.kills == []
+
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=1))
+    _next(sup, world, 1)
+    assert world.kills == [WORKER]
+
+
+def test_a_stop_during_stopping_keeps_the_original_ask_time(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    asked = world.now
+    sup.tick()
+    world.now += timedelta(seconds=60)
+    sup.stop("Pie64")
+
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=49))
+    view = _next(sup, world, 49)  # 109 s from the restart's ask, not from the press
+    assert view.state == InstanceState.STOPPING
+    assert view.desired_reason == "override_stop"
+    assert view.until == asked + timedelta(seconds=L.STOP_ESCALATE_S)
+    assert sup._recycling == {} and world.kills == []
+
+    _next(sup, world, 1)
+    assert world.kills == [WORKER]
+
+
+def test_a_stop_past_the_ordinary_limit_kills_on_the_next_tick(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    sup.tick()
+    world.now += timedelta(seconds=200)
+    sup.stop("Pie64")
+    _next(sup, world, 1)
+    assert sup._recycling == {}
+    assert world.kills == [WORKER]
+    assert world.closes == []  # abandoned, so the emulator is left alone
 
 
 def test_closed_emulator_is_not_an_offline_fault(tmp_path, world, monkeypatch) -> None:
@@ -1092,6 +1175,26 @@ def test_stopping_resumes_as_stopping(tmp_path, world) -> None:
     assert len(world.closes) == 1
 
 
+def test_a_resumed_stopping_job_keeps_the_restart_grace(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    sup.tick()
+
+    fresh = _reboot(tmp_path, world)
+    world.now += timedelta(seconds=30)
+    asked = world.now  # the new supervisor has no ask on record, so its first tick is one
+    _heartbeat(tmp_path, "Pie64", WORKER, asked)
+    deadline = asked + timedelta(seconds=L.RECYCLE_STOP_GRACE_S)
+    assert _view(fresh.tick(), "Pie64").until == deadline
+
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=111))
+    assert _next(fresh, world, 111).state == InstanceState.STOPPING
+    assert world.kills == []
+
+    _next(fresh, world, L.RECYCLE_STOP_GRACE_S - 111)
+    assert world.kills == [WORKER]
+
+
 def test_a_stop_after_the_restart_abandons_a_resumed_stopping_job(tmp_path, world) -> None:
     sup = _guarded(tmp_path, world)
     world.player_gb = 41.0
@@ -1442,8 +1545,8 @@ def test_persistent_raises_in_stopping_never_block_the_graceful_stop(
     assert (S.instance_dir(tmp_path, "Pie64") / L.STOP_FLAG).exists()
     assert pushed == []  # nothing has failed yet: the worker is finishing its match
 
-    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=120))
-    _next(sup, world, 120)  # past STOP_ESCALATE_S
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=L.RECYCLE_STOP_GRACE_S))
+    _next(sup, world, L.RECYCLE_STOP_GRACE_S)
     assert world.kills == [WORKER]
 
     view = _next(sup, world)
