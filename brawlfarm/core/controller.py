@@ -154,6 +154,12 @@ class Controller:
         self.popup_count = 0
         self.last_move = 0.0
         self._last_move_kind: str | None = None  # the last move tick's decision, for shadow rows
+        # What that tick did, for the same rows. The heading is the value handed to the swipe:
+        # radians, atan2(dy, dx) on screen with y down, so 0 is right and pi/2 is down, and a
+        # wander lets it run past a full turn. The session converts it once, for the row. None
+        # when the tick swiped nothing. The target is the bush's screen point, None on a wander.
+        self._last_move_heading: float | None = None
+        self._last_move_target: tuple[int, int] | None = None
         # In-match anti-detection state: a continuously-wandering heading + per-action
         # randomized gaps, re-rolled each time we act so the attack/move cadence and the
         # movement direction never settle into a detectable repeating pattern.
@@ -1088,6 +1094,7 @@ class Controller:
         self.set_phase("playing")
         self.last_attack = self.last_move = 0.0
         self._last_move_kind = None
+        self._last_move_heading = self._last_move_target = None
         self._gas.reset()
         self._gas_edges = set()
         # Phase B: bush/relocation state must not leak across matches either.
@@ -1173,6 +1180,7 @@ class Controller:
         dy = int(mag * math.sin(heading))
         dur = int(config.MOVE_DURATION_MS * random.uniform(0.8, 1.25))
         adb.swipe(ox, oy, ox + dx, oy + dy, dur)
+        self._last_move_heading = heading  # every move swipes here, the jitter's heading included
 
     def _wander_move(self, gas_fr) -> None:
         """The existing random-drift move (plus the Phase A gas repulsion) — the
@@ -1196,6 +1204,7 @@ class Controller:
                 self._wander_move(gas_fr)  # cap hit: the wander's gas repulsion flees
                 return
             self._relocations += 1
+            self._last_move_target = action.target
             self._heading = self._heading_to(action.target)
             self._swipe_heading(self._heading)
             if self._bush_logged != "gas_relocate":
@@ -1204,6 +1213,7 @@ class Controller:
                 self.log(f"bush: gas closing -> relocate toward {action.target}")
             return
         # HIDE
+        self._last_move_target = action.target
         if action.at_target:
             # Hidden: hold position, micro-jitter on its own slow cadence so we
             # register input (anti-AFK) without leaving the bush.
@@ -1289,6 +1299,7 @@ class Controller:
         # heading with a steer, never suppresses the move itself (so idle-disconnect
         # prevention is preserved). It also never overrides the attack/survival reactions.
         if now - self.last_move >= self._move_gap:
+            self._last_move_heading = self._last_move_target = None  # this tick sets its own
             action = self._bush_action(screen, gas_fr)
             if action is not None and action.kind != "wander":
                 self._steer_to_bush(action, now, gas_fr)
@@ -1351,6 +1362,8 @@ class Controller:
         # After rejoin it loads back into the match; resume playing (with movement).
         self.last_attack = 0.0
         self.last_move = 0.0
+        self._last_move_kind = None  # with last_move: a kept kind would show with a null age
+        self._last_move_heading = self._last_move_target = None
         self.set_phase("playing")
 
     def handle_daily_streak(self, screen) -> None:
@@ -1712,6 +1725,8 @@ class Controller:
                 self.phase,
                 farm_move=getattr(self, "_last_move_kind", None),
                 moved_at=getattr(self, "last_move", None),
+                farm_heading=getattr(self, "_last_move_heading", None),
+                farm_target=getattr(self, "_last_move_target", None),
             )
             for kind, fields in rows:
                 self.dl.event(kind, **fields)

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -60,6 +61,13 @@ def _plain(value: Any) -> Any:
     if isinstance(value, float | np.floating):
         return round(float(value), 3)
     return int(value)
+
+
+def _degrees(heading: float) -> float:
+    """The farm's heading for a row. It comes in as the controller swiped it, radians from
+    atan2(dy, dx) on screen with y down and no wrap on a wander; a row says degrees in [0, 360),
+    clockwise on screen from 0 at right, so 90 is down. The second modulo is for what rounds up."""
+    return round(math.degrees(heading) % 360.0, 1) % 360.0
 
 
 def _coverage(hits: dict[str, int], frames: int) -> dict[str, float]:
@@ -133,8 +141,20 @@ class PlaySession:
         self._read_hits: dict[str, int] = {}
         self._rule_calls: dict[str, int] = {}
         self._rules_errors = 0
-        # state, phase, clock at the last tick, then the kind and time of the farm's last move
-        self._farm: tuple[str, str, float, str | None, float | None] | None = None
+        # state, phase, clock at the last tick, then the farm's last move: kind, time, heading
+        # in the controller's radians and target
+        self._farm: (
+            tuple[
+                str,
+                str,
+                float,
+                str | None,
+                float | None,
+                float | None,
+                tuple[int, int] | None,
+            ]
+            | None
+        ) = None
         self._enemy_frames: deque[bool] = deque(maxlen=rules.ENEMY_WINDOW)
         self._file: Any = None
         self._file_name = ""
@@ -164,15 +184,19 @@ class PlaySession:
         *,
         farm_move: str | None = None,
         moved_at: float | None = None,
+        farm_heading: float | None = None,
+        farm_target: tuple[int, int] | None = None,
     ) -> list[Event]:
         """One controller tick. Returns the feed rows the controller writes.
 
         ``farm_move`` is what the farm's last move tick decided. ``moved_at`` is when, on this
         session's clock: the controller reads ``time.monotonic``, the default here, and it builds
         the only session that ever gets the value. 0.0 is the controller's "not moved yet".
+        ``farm_heading`` is what that tick swiped, in the controller's radians (see ``_degrees``),
+        None if it swiped nothing. ``farm_target`` is the bush it steered to, None on a wander.
         """
         try:
-            self._observe(state, phase, farm_move, moved_at)
+            self._observe(state, phase, farm_move, moved_at, farm_heading, farm_target)
         except Exception as exc:  # shadow mode must never stop the farm loop
             log.warning("shadow session error: %s", exc)
             self._await_stop = True
@@ -199,10 +223,24 @@ class PlaySession:
         return self._drain()
 
     def _observe(
-        self, state: State, phase: str, farm_move: str | None, moved_at: float | None
+        self,
+        state: State,
+        phase: str,
+        farm_move: str | None,
+        moved_at: float | None,
+        farm_heading: float | None,
+        farm_target: tuple[int, int] | None,
     ) -> None:
         with self._lock:
-            self._farm = (state.value, phase, self._clock(), farm_move, moved_at)
+            self._farm = (
+                state.value,
+                phase,
+                self._clock(),
+                farm_move,
+                moved_at,
+                farm_heading,
+                farm_target,
+            )
         playing = phase == "playing"
         match_over = not playing or state in matchrec.STOP_STATES
         if self._running:
@@ -471,14 +509,20 @@ class PlaySession:
             "farm": None,
             "farm_move": None,
             "farm_move_age": None,
+            "farm_heading": None,
+            "farm_target": None,
         }
         if farm is not None:
             # the label the farm's last tick gave and its last move; its taps never reach here
-            state, phase, seen, move, moved_at = farm
+            state, phase, seen, move, moved_at, heading, target = farm
             added["farm"] = {"state": state, "phase": phase, "age": round(self._clock() - seen, 3)}
             added["farm_move"] = move
             if moved_at:
                 added["farm_move_age"] = round(self._clock() - moved_at, 3)
+            if heading is not None:
+                added["farm_heading"] = _degrees(heading)
+            if target is not None:
+                added["farm_target"] = list(target)
         return added
 
     # -- the file ----------------------------------------------------------------

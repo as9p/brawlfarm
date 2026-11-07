@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import math
 import subprocess
 import sys
 import threading
@@ -250,6 +251,8 @@ def test_the_happy_path_writes_a_file_and_reports_on_and_a_summary(h: Harness, t
         "farm",
         "farm_move",
         "farm_move_age",
+        "farm_heading",
+        "farm_target",
     }
     assert lines[1]["boxes"] == [["enemy", 0.912, 10, 20, 30, 40], ["bush", 0.555, 1, 2, 3, 4]]
     assert h.sources[0].stopped and not h.session.active
@@ -551,6 +554,51 @@ def test_a_caller_with_no_move_writes_nulls(h, tmp_path) -> None:
 
     row = rows_of(tmp_path, done)[0]
     assert row["farm_move"] is None and row["farm_move_age"] is None
+    assert row["farm_heading"] is None and row["farm_target"] is None
+
+
+def test_a_row_says_where_the_farm_steered(h, tmp_path) -> None:
+    h.session.observe(
+        State.IN_MATCH,
+        "playing",
+        farm_move="hide",
+        moved_at=99.5,
+        farm_heading=math.pi / 2,
+        farm_target=(640, 310),
+    )
+    h.run()
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+
+    row = rows_of(tmp_path, done)[0]
+    assert row["farm_heading"] == 90.0 and row["farm_target"] == [640, 310]
+
+
+def test_a_wander_has_a_heading_and_no_target(h, tmp_path) -> None:
+    h.session.observe(
+        State.IN_MATCH, "playing", farm_move="wander", moved_at=99.5, farm_heading=0.0
+    )
+    h.run()
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+
+    row = rows_of(tmp_path, done)[0]
+    assert row["farm_heading"] == 0.0 and row["farm_target"] is None  # 0.0 is a heading
+
+
+@pytest.mark.parametrize(
+    ("radians", "degrees"),
+    [
+        (0.0, 0.0),
+        (math.pi, 180.0),
+        (-math.pi / 2, 270.0),  # atan2 gives negatives
+        (2 * math.pi + math.pi / 2, 90.0),  # a wander runs past a full turn
+        (1.23456, 70.7),
+        (math.radians(359.97), 0.0),  # rounds up to a full turn, which is not a value
+    ],
+)
+def test_a_heading_is_degrees_in_one_turn_to_a_tenth(radians, degrees) -> None:
+    assert session._degrees(radians) == degrees
 
 
 def test_a_farm_that_has_not_moved_yet_has_no_age(h, tmp_path) -> None:
