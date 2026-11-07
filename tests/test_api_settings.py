@@ -82,6 +82,33 @@ def test_put_round_trips_the_shadow_flag_no_component_renders(api) -> None:
     assert "shadow = true" in S.config_path(home).read_text(encoding="utf-8")
 
 
+def test_put_round_trips_the_emulator_recycle_fields(api) -> None:
+    client, sup, home = api
+    doc = client.get("/api/settings").json()
+    assert doc["behavior"]["emulator_recycle_gb"] == 0.0
+    assert doc["behavior"]["commit_floor_gb"] == 0.0
+    assert doc["behavior"]["emulator_path"].endswith("HD-Player.exe")
+    doc["behavior"]["emulator_recycle_gb"] = 40.5
+    doc["behavior"]["commit_floor_gb"] = 12.0
+    doc["behavior"]["emulator_path"] = r"D:\BlueStacks\HD-Player.exe"
+    r = client.put("/api/settings", json=doc)
+    assert r.status_code == 200
+    assert sup.settings.behavior.emulator_recycle_gb == 40.5
+    assert sup.settings.behavior.commit_floor_gb == 12.0
+    assert client.get("/api/settings").json()["behavior"] == r.json()["behavior"]
+    assert S.load(home).behavior.emulator_path == r"D:\BlueStacks\HD-Player.exe"
+
+
+@pytest.mark.parametrize("field", ["emulator_recycle_gb", "commit_floor_gb"])
+def test_put_refuses_a_negative_memory_limit(api, field) -> None:
+    client, sup, home = api
+    doc = client.get("/api/settings").json()
+    doc["behavior"][field] = -1.0
+    r = client.put("/api/settings", json=doc)
+    assert r.status_code == 422
+    assert field in r.json()["detail"]
+
+
 def test_put_names_the_field_it_rejected(api) -> None:
     client, sup, _home = api
     doc = client.get("/api/settings").json()

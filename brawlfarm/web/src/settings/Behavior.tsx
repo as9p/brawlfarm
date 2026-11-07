@@ -44,7 +44,12 @@ interface Toggle {
   write: (settings: AppSettings, next: boolean) => void;
 }
 
-function behavior<K extends keyof AppSettings["behavior"]>(
+/** The behavior keys a switch can hold: the section also has number and string settings. */
+type BehaviorSwitch = {
+  [K in keyof AppSettings["behavior"]]: AppSettings["behavior"][K] extends boolean ? K : never;
+}[keyof AppSettings["behavior"]];
+
+function behavior<K extends BehaviorSwitch>(
   key: K,
   title: string,
   description: string,

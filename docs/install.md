@@ -72,3 +72,18 @@ Turning recordings and video into a labelled training set for the play mode dete
 ## Settings
 
 Settings live in `%LOCALAPPDATA%\brawlfarm\config.toml` (override the folder with `BRAWLFARM_HOME`). Add one `[[instances]]` table per BlueStacks instance with its `name` and `adb_port`; each instance's files live under `instances/<name>/`. Stopping the process leaves workers running; the next start reattaches to them through their status files.
+
+### Emulator restarts
+
+BlueStacks' HD-Player leaks memory under the farm, so the supervisor can restart it between matches. Two settings under `[behavior]`, both off by default (0):
+
+- `emulator_recycle_gb`: restart when HD-Player's private memory reaches this many GB.
+- `commit_floor_gb`: restart when free commit charge drops below this many GB, but only if HD-Player itself holds at least 8 GB, because a restart cannot help when other programs hold the memory.
+
+The check is commit and not free physical memory because commit is what runs out. Windows refuses allocations once the commit limit is reached, and that has happened with about 5.6 GB of physical memory still free, so a physical memory check would never have seen it.
+
+The checks run only while a worker is running and the instance is wanted running. A restart lets the worker finish its match, closes HD-Player, reopens it from `emulator_path`, waits up to 6 minutes for Android to boot, then 2 minutes more before the worker starts. While the worker finishes its match the panel shows `stopping`, and a worker still going 6 minutes after the ask is killed. After that the instance reads as `scheduled_break`, reason `emulator_recycle`. An instance restarts at most once per 30 minutes. If a step fails you get one alert, titled Emulator restart failed, and the instance stays stopped, reason `emulator_recycle_failed`, until you press Start. Stopping an instance while the worker is still finishing its match abandons the restart and nothing is closed. From the close onward the restart finishes, then the instance stays stopped.
+
+Closing brawlfarm mid-restart is safe: progress is kept in `recycle.json` in the instance's folder, and the next start resumes it, reopening the emulator if it is still closed. If the instance is set to stop at that start, or the job is more than 8 minutes old (after a power cut, say), the restart and its `recycle.json` are dropped instead and the emulator stays as it is. A failed restart stays failed across that, and the 30-minute limit holds too (`recycle_last.json`). Removing an instance from the settings drops its restart and both files, so an emulator that was closed at that moment stays closed until you open it.
+
+The panel has no field for these yet. Set them in `config.toml` or through `PUT /api/settings`.

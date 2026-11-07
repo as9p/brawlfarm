@@ -4,6 +4,7 @@ boot grace and offline backoff, and exposes start / stop / stop-now / restart / 
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
@@ -14,9 +15,11 @@ from pathlib import Path
 import pytest
 
 from brawlfarm import settings as S
+from brawlfarm.api.alerts import AlertStore
 from brawlfarm.core import config, scheduler, status
 from brawlfarm.supervisor import Health, InstanceState, Supervisor
 from brawlfarm.supervisor import loop as L
+from brawlfarm.supervisor.state import RECYCLE_FAILED_REASON, InstanceView
 
 T0 = datetime(2026, 9, 10, 12, 0, 0)
 
@@ -44,6 +47,16 @@ class World:
     pings: int = 0
     next_pid: int = 100
     probe_delay_s: float = 0.0
+    players: dict[str, int] = field(default_factory=dict)  # instance -> HD-Player PID
+    player_gb: float = 1.0
+    commit_gb: float = 100.0
+    close_sticks: bool = False  # the close is delivered and HD-Player stays anyway
+    close_ok: bool = True
+    open_ok: bool = True
+    booted: bool = True
+    closes: list[tuple[int, float]] = field(default_factory=list)
+    opens: list[tuple[str, str]] = field(default_factory=list)
+    boot_checks: list[int] = field(default_factory=list)
 
     def clock(self):
         return self.now
@@ -82,6 +95,32 @@ class World:
         self.pings += 1
         return True
 
+    def find_player(self, instance):
+        return self.players.get(instance)
+
+    def private_gb(self, pid):
+        return self.player_gb
+
+    def commit_free_gb(self):
+        return self.commit_gb
+
+    def close_player(self, pid, grace_s, log=print):
+        self.closes.append((pid, grace_s))
+        if self.close_ok and not self.close_sticks:
+            self.players = {n: p for n, p in self.players.items() if p != pid}
+        return self.close_ok
+
+    def open_player(self, path, instance, log=print):
+        self.opens.append((path, instance))
+        if not self.open_ok:
+            return None
+        self.players[instance] = 9000 + len(self.opens)
+        return self.players[instance]
+
+    def boot_done(self, adb_path, port):
+        self.boot_checks.append(port)
+        return self.booted
+
 
 _PORTS = {"Pie64": 5555, "Rome64": 5565}
 _TAGS = {"Pie64": "#2P0YLQ9", "Rome64": ""}
@@ -111,6 +150,12 @@ def make_sup(tmp_path: Path, world: World, names=("Pie64", "Rome64")) -> Supervi
         sleep=lambda _s: None,
         events_refresh=world.refresh,
         pinger=world.ping,
+        find_player=world.find_player,
+        private_gb=world.private_gb,
+        commit_free_gb=world.commit_free_gb,
+        close_player=world.close_player,
+        open_player=world.open_player,
+        boot_done=world.boot_done,
     )
     # Schedule off = legacy always-run, so tests control "desired" through overrides.
     scheduler.set_enabled(list(names), False)
@@ -133,8 +178,6 @@ def _heartbeat(tmp_path: Path, name: str, pid: int, now: datetime, age_s: float 
     ts = (now - timedelta(seconds=age_s)).strftime("%Y-%m-%dT%H:%M:%S")
     status.write_status(d, {"pid": pid, "phase": "playing", "games_played": 3, **fields})
     # write_status stamps "now"; rewrite ts to the age we want
-    import json
-
     p = d / "status.json"
     data = json.loads(p.read_text(encoding="utf-8"))
     data["ts"] = ts
@@ -506,3 +549,1114 @@ def test_a_live_observer_stops_when_observe_is_cleared(sup, world, tmp_path) -> 
     views = sup.tick()
     assert (S.instance_dir(tmp_path, "Pie64") / "stop.flag").exists()
     assert _view(views, "Pie64").state == InstanceState.STOPPING
+
+
+# --- the emulator guard: restart a leaking HD-Player, one step per tick -----------------
+
+PLAYER = 777
+WORKER = 4242
+
+
+def _guarded(
+    tmp_path: Path, world: World, recycle_gb: float = 40.0, floor_gb: float = 0.0
+) -> Supervisor:
+    """One farming instance with a live worker and a live HD-Player, limits applied."""
+    sup = make_sup(tmp_path, world, ("Pie64",))
+    sup.settings.behavior.emulator_recycle_gb = recycle_gb
+    sup.settings.behavior.commit_floor_gb = floor_gb
+    sup.apply_settings(sup.settings)
+    world.alive.add(WORKER)
+    world.players["Pie64"] = PLAYER
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+    return sup
+
+
+def _next(sup: Supervisor, world: World, seconds: float = 60) -> InstanceView:
+    world.now += timedelta(seconds=seconds)
+    return _view(sup.tick(), "Pie64")
+
+
+def _to_booting(sup: Supervisor, world: World) -> None:
+    """Trigger, the worker exits, close, confirm gone: the next tick opens HD-Player."""
+    world.player_gb = 41.0
+    sup.tick()
+    world.alive.discard(WORKER)
+    _next(sup, world)
+    _next(sup, world)
+
+
+def _capture_alerts(sup: Supervisor, monkeypatch) -> tuple[list, list]:
+    pushed: list = []
+    panel: list = []
+    monkeypatch.setattr(L.notify, "maybe_alert", lambda kind, fields: pushed.append((kind, fields)))
+    sup.subscribe_alerts(lambda name, kind, fields: panel.append((name, kind, fields)))
+    return pushed, panel
+
+
+def _schedule_files(tmp_path: Path) -> dict[Path, dict]:
+    """Both files as data, less the stamp the scheduler's own tick moves every minute."""
+    out = {}
+    for f in tmp_path.rglob("*.json"):
+        if f.name in ("schedule.json", "override.json"):
+            data = json.loads(f.read_text(encoding="utf-8"))
+            for section in data.values():
+                if isinstance(section, dict):
+                    section.pop("updated_at", None)
+            out[f] = data
+    return out
+
+
+def test_guard_is_off_by_default(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world, recycle_gb=0.0, floor_gb=0.0)
+    world.player_gb = 500.0
+    world.commit_gb = 0.1
+    view = _view(sup.tick(), "Pie64")
+    assert view.state == InstanceState.FARMING
+    assert view.desired_reason == "disabled"  # the schedule's own reason, nothing of ours
+    assert not (S.instance_dir(tmp_path, "Pie64") / "stop.flag").exists()
+    assert world.closes == []
+
+
+def test_guard_needs_a_player_to_restart(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    world.players.clear()
+    assert _view(sup.tick(), "Pie64").state == InstanceState.FARMING
+    assert not (S.instance_dir(tmp_path, "Pie64") / "stop.flag").exists()
+
+
+def test_guard_ignores_a_failed_commit_read(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world, recycle_gb=0.0, floor_gb=12.0)
+    world.player_gb = 41.0
+    world.commit_gb = float("inf")  # what commit_free_gb answers when the read fails
+    assert _view(sup.tick(), "Pie64").state == InstanceState.FARMING
+
+
+def test_memory_trigger_runs_the_full_restart_and_launches_once(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    sup.tick()  # the scheduler's own first tick writes schedule.json
+    before = _schedule_files(tmp_path)
+    assert before
+    world.player_gb = 40.0  # at the limit counts
+
+    view = _view(sup.tick(), "Pie64")  # 1. stopping: the graceful path, the match finishes
+    assert view.state == InstanceState.STOPPING
+    assert view.desired_reason == "emulator_recycle"
+    assert (S.instance_dir(tmp_path, "Pie64") / "stop.flag").exists()
+    assert world.kills == [] and world.closes == []
+
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+    assert _next(sup, world).state == InstanceState.STOPPING  # still in its match
+    assert world.closes == []
+
+    world.alive.discard(WORKER)
+    view = _next(sup, world)  # 2. closing
+    assert view.state == InstanceState.SCHEDULED_BREAK
+    assert view.desired_reason == "emulator_recycle"
+    assert world.closes == [(PLAYER, 20.0)]
+    assert world.opens == []
+
+    view = _next(sup, world)  # gone is confirmed on a later tick, and that is the whole tick
+    assert world.opens == []
+
+    view = _next(sup, world)  # 3. booting: open, and no boot check on the same tick
+    assert world.opens == [(sup.settings.behavior.emulator_path, "Pie64")]
+    assert world.boot_checks == []
+
+    world.booted = False
+    view = _next(sup, world)
+    assert world.boot_checks == [5555]
+    assert view.state == InstanceState.SCHEDULED_BREAK
+
+    world.booted = True
+    _next(sup, world)  # 4. settling starts here
+    assert world.boot_checks == [5555, 5555]
+    view = _next(sup, world)
+    assert view.desired_reason == "emulator_recycle"
+    assert world.launches == []
+
+    view = _next(sup, world)  # 120 s after boot: 5. the normal path launches
+    assert [n for _, _, n in world.launches] == ["Pie64"]
+    assert view.state == InstanceState.STARTING
+    assert view.desired_reason == "disabled"  # the schedule's own reason, nothing of ours
+    assert not (S.instance_dir(tmp_path, "Pie64") / "stop.flag").exists()
+
+    _next(sup, world)
+    assert len(world.launches) == 1
+    assert len(world.closes) == 1
+    assert _schedule_files(tmp_path) == before  # never the schedule, never the override
+    assert scheduler.read_override("Pie64") is None
+
+
+def test_stubborn_worker_is_killed_by_the_existing_escalation(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    sup.tick()
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+    _next(sup, world, L.RECYCLE_STOP_GRACE_S)
+    assert world.kills == [WORKER]
+    assert world.closes == []  # the kill was this tick's step
+    _next(sup, world)
+    assert world.closes == [(PLAYER, 20.0)]
+
+
+def test_a_restart_waits_out_the_match_before_the_kill(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    asked = world.now
+    deadline = asked + timedelta(seconds=L.RECYCLE_STOP_GRACE_S)
+    assert _view(sup.tick(), "Pie64").until == deadline
+
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=111))
+    view = _next(sup, world, 111)  # past STOP_ESCALATE_S, still in its match
+    assert view.state == InstanceState.STOPPING
+    assert view.until == deadline
+    assert world.kills == []
+
+    _heartbeat(tmp_path, "Pie64", WORKER, deadline - timedelta(seconds=1))
+    assert _next(sup, world, L.RECYCLE_STOP_GRACE_S - 112).state == InstanceState.STOPPING
+    assert world.kills == []
+
+    _next(sup, world, 1)
+    assert world.kills == [WORKER]
+    assert world.closes == []
+
+
+def _override_stop(sup: Supervisor, world: World) -> None:
+    scheduler.write_override("Pie64", "stop", world.now + timedelta(days=1))
+
+
+@pytest.mark.parametrize(
+    "ask",
+    [
+        lambda sup, world: sup.stop("Pie64"),
+        _override_stop,
+        lambda sup, world: sup.restart("Pie64"),
+        lambda sup, world: sup.observe("Pie64", True),  # wrong_kind: a farm worker has to go
+    ],
+    ids=["owner_stop", "desired_stop", "restart", "wrong_kind"],
+)
+def test_every_other_stop_keeps_the_ordinary_limit(tmp_path, world, ask) -> None:
+    sup = _guarded(tmp_path, world)
+    asked = world.now
+    ask(sup, world)
+    assert _view(sup.tick(), "Pie64").until == asked + timedelta(seconds=L.STOP_ESCALATE_S)
+
+    world.now = asked + timedelta(seconds=L.STOP_ESCALATE_S - 1)
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+    sup.tick()
+    assert world.kills == []
+
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=1))
+    _next(sup, world, 1)
+    assert world.kills == [WORKER]
+
+
+def test_a_stop_during_stopping_keeps_the_original_ask_time(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    asked = world.now
+    sup.tick()
+    world.now += timedelta(seconds=60)
+    sup.stop("Pie64")
+
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=49))
+    view = _next(sup, world, 49)  # 109 s from the restart's ask, not from the press
+    assert view.state == InstanceState.STOPPING
+    assert view.desired_reason == "override_stop"
+    assert view.until == asked + timedelta(seconds=L.STOP_ESCALATE_S)
+    assert sup._recycling == {} and world.kills == []
+
+    _next(sup, world, 1)
+    assert world.kills == [WORKER]
+
+
+def test_a_stop_past_the_ordinary_limit_kills_on_the_next_tick(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    sup.tick()
+    world.now += timedelta(seconds=200)
+    sup.stop("Pie64")
+    _next(sup, world, 1)
+    assert sup._recycling == {}
+    assert world.kills == [WORKER]
+    assert world.closes == []  # abandoned, so the emulator is left alone
+
+
+def test_closed_emulator_is_not_an_offline_fault(tmp_path, world, monkeypatch) -> None:
+    sup = _guarded(tmp_path, world)
+    pushed, panel = _capture_alerts(sup, monkeypatch)
+    _to_booting(sup, world)
+    world.online[5555] = False  # adb cannot see a closed or booting emulator
+    world.booted = False
+    for _ in range(4):
+        view = _next(sup, world)
+        assert view.state == InstanceState.SCHEDULED_BREAK
+        assert sup._backoff.until("Pie64", world.now) is None
+    assert sup._backoff.misses("Pie64") == 0
+    assert pushed == [] and panel == []
+
+
+def test_commit_trigger_needs_hd_player_to_hold_the_memory(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world, recycle_gb=0.0, floor_gb=12.0)
+    world.commit_gb = 11.9
+    world.player_gb = L.MIN_RECYCLE_GB - 0.1  # something else holds the commit
+    view = _view(sup.tick(), "Pie64")
+    assert view.state == InstanceState.FARMING
+    assert not (S.instance_dir(tmp_path, "Pie64") / "stop.flag").exists()
+
+    world.player_gb = L.MIN_RECYCLE_GB
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+    assert _next(sup, world).desired_reason == "emulator_recycle"
+
+
+def test_commit_at_the_floor_does_not_trigger(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world, recycle_gb=0.0, floor_gb=12.0)
+    world.commit_gb = 12.0
+    world.player_gb = 41.0
+    assert _view(sup.tick(), "Pie64").state == InstanceState.FARMING
+
+
+def test_no_second_restart_inside_thirty_minutes(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    started = world.now
+    _to_booting(sup, world)
+    for _ in range(5):
+        _next(sup, world)
+    assert len(world.launches) == 1
+
+    # The leak is back at once and the new worker is up, but the window is from the start.
+    world.alive.add(5000)
+    world.now = started + timedelta(seconds=L.MIN_INTERVAL_S - 1)
+    _heartbeat(tmp_path, "Pie64", 5000, world.now)
+    assert _view(sup.tick(), "Pie64").state == InstanceState.FARMING
+
+    world.now = started + timedelta(seconds=L.MIN_INTERVAL_S)
+    _heartbeat(tmp_path, "Pie64", 5000, world.now)
+    assert _view(sup.tick(), "Pie64").desired_reason == "emulator_recycle"
+
+
+def test_boot_timeout_alerts_once_and_stays_stopped_until_start(
+    tmp_path, world, monkeypatch
+) -> None:
+    sup = _guarded(tmp_path, world)
+    pushed, panel = _capture_alerts(sup, monkeypatch)
+    world.booted = False
+    _to_booting(sup, world)
+    _next(sup, world)  # open
+
+    for _ in range(5):  # 300 s after the open: still waiting
+        assert _next(sup, world).desired_reason == "emulator_recycle"
+    assert pushed == []
+
+    view = _next(sup, world)  # 360 s
+    assert view.state == InstanceState.STOPPED
+    assert view.desired_reason == "emulator_recycle_failed"
+    assert view.pid is None
+    assert view.note != ""
+    assert len(pushed) == 1 and len(panel) == 1
+    assert pushed[0][0] == "offline"
+    assert panel[0][:2] == ("Pie64", "offline")
+
+    world.booted = True  # no retry, even with the emulator up and adb answering
+    checks = len(world.boot_checks)
+    for _ in range(5):
+        view = _next(sup, world)
+        assert view.desired_reason == "emulator_recycle_failed"
+    assert len(world.boot_checks) == checks
+    assert len(world.opens) == 1 and world.launches == []
+    assert len(pushed) == 1 and len(panel) == 1
+
+    sup.start("Pie64")
+    view = _next(sup, world)
+    assert [n for _, _, n in world.launches] == ["Pie64"]
+    assert view.desired_reason == "disabled"  # the schedule's own reason, nothing of ours
+
+
+def test_failed_open_goes_straight_to_failed(tmp_path, world, monkeypatch) -> None:
+    sup = _guarded(tmp_path, world)
+    pushed, _panel = _capture_alerts(sup, monkeypatch)
+    world.open_ok = False
+    _to_booting(sup, world)
+    view = _next(sup, world)
+    assert view.desired_reason == "emulator_recycle_failed"
+    assert len(pushed) == 1
+    _next(sup, world)
+    assert len(world.opens) == 1
+    assert len(pushed) == 1
+
+
+def test_close_never_confirmed_fails_after_three_ticks(tmp_path, world, monkeypatch) -> None:
+    sup = _guarded(tmp_path, world)
+    pushed, _panel = _capture_alerts(sup, monkeypatch)
+    world.close_sticks = True
+    world.player_gb = 41.0
+    sup.tick()
+    world.alive.discard(WORKER)
+    _next(sup, world)  # the close
+    assert _next(sup, world).desired_reason == "emulator_recycle"
+    assert _next(sup, world).desired_reason == "emulator_recycle"
+    assert _next(sup, world).desired_reason == "emulator_recycle_failed"
+    assert len(pushed) == 1
+    assert world.opens == []
+    assert len(world.closes) == 1
+
+
+def test_refused_close_fails_without_waiting(tmp_path, world, monkeypatch) -> None:
+    sup = _guarded(tmp_path, world)
+    pushed, _panel = _capture_alerts(sup, monkeypatch)
+    world.close_ok = False
+    world.player_gb = 41.0
+    sup.tick()
+    world.alive.discard(WORKER)
+    assert _next(sup, world).desired_reason == "emulator_recycle_failed"
+    assert len(pushed) == 1
+    assert world.opens == []
+
+
+def test_owner_stop_while_stopping_abandons_the_restart(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    sup.tick()
+    sup.stop("Pie64")
+    world.alive.discard(WORKER)
+    for _ in range(8):
+        view = _next(sup, world)
+        assert view.state == InstanceState.STOPPED
+        assert view.desired_reason == "override_stop"
+    assert world.closes == [] and world.opens == [] and world.launches == []
+
+
+def test_owner_stop_past_stopping_finishes_the_boot_then_stays_stopped(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_booting(sup, world)
+    sup.stop("Pie64")
+    for _ in range(8):
+        view = _next(sup, world)
+        assert view.state == InstanceState.STOPPED
+        assert view.desired_reason == "override_stop"
+    assert len(world.opens) == 1  # not left closed halfway through
+    assert world.launches == []
+
+    sup.start("Pie64")
+    _next(sup, world)
+    assert [n for _, _, n in world.launches] == ["Pie64"]
+
+
+def test_guard_settings_apply_through_apply_settings(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world, recycle_gb=0.0, floor_gb=0.0)
+    world.player_gb = 41.0
+    assert _view(sup.tick(), "Pie64").state == InstanceState.FARMING
+
+    sup.settings.behavior.emulator_recycle_gb = 40.0
+    sup.apply_settings(sup.settings)
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+    assert _next(sup, world).desired_reason == "emulator_recycle"
+
+
+def test_guard_changes_nothing_while_desired_is_stop(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    sup.stop("Pie64")
+    world.alive.discard(WORKER)
+    for _ in range(3):
+        assert _next(sup, world).desired_reason == "override_stop"
+    assert world.closes == []
+
+
+def test_guard_never_restarts_under_a_dead_worker(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    world.alive.discard(WORKER)
+    view = _view(sup.tick(), "Pie64")
+    assert view.desired_reason == "disabled"  # the schedule's own reason, nothing of ours
+    assert [n for _, _, n in world.launches] == ["Pie64"]  # the ordinary relaunch
+    assert world.closes == []
+
+
+def test_guard_leaves_an_observer_alone(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    scheduler.write_override("Pie64", "observe", world.now + timedelta(days=1))
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now, mode="observe")
+    assert _view(sup.tick(), "Pie64").state == InstanceState.FARMING
+    assert world.closes == []
+
+
+def test_restart_respects_the_one_launch_per_tick_rule(tmp_path, world) -> None:
+    sup = make_sup(tmp_path, world)
+    sup.settings.behavior.emulator_recycle_gb = 40.0
+    sup.apply_settings(sup.settings)
+    world.alive |= {1111, 2222}
+    world.players["Rome64"] = PLAYER  # Pie64 has no player, so only Rome64 restarts
+    world.player_gb = 41.0
+    _heartbeat(tmp_path, "Pie64", 1111, world.now)
+    _heartbeat(tmp_path, "Rome64", 2222, world.now)
+    sup.tick()
+    world.alive.discard(2222)
+    for _ in range(5):  # close, confirm, open, boot, settle: the next tick launches
+        world.now += timedelta(seconds=60)
+        _heartbeat(tmp_path, "Pie64", 1111, world.now)
+        sup.tick()
+    assert world.launches == []
+
+    world.alive.discard(1111)  # Pie64 goes first this tick and takes the launch
+    world.now += timedelta(seconds=60)
+    views = sup.tick()
+    assert [n for _, _, n in world.launches] == ["Pie64"]
+    assert _view(views, "Rome64").note == "Waiting for its turn to start"
+    world.now += timedelta(seconds=60)
+    sup.tick()
+    assert [n for _, _, n in world.launches] == ["Pie64", "Rome64"]
+
+
+# --- a supervisor restart in the middle of an emulator restart --------------------------
+
+
+def _reboot(tmp_path: Path, world: World) -> Supervisor:
+    """A new supervisor over the same home: everything it held in memory is gone."""
+    sup = make_sup(tmp_path, world, ("Pie64",))
+    sup.settings.behavior.emulator_recycle_gb = 40.0
+    sup.apply_settings(sup.settings)
+    return sup
+
+
+def _to_phase(sup: Supervisor, world: World, phase: str) -> None:
+    """Walk a restart up to ``phase``, stopping right after the tick that reached it.
+    "closed" is the moment BOOTING has begun and HD-Player has not been opened yet."""
+    world.player_gb = 41.0
+    sup.tick()  # stopping
+    world.alive.discard(WORKER)
+    steps = {"closing": 1, "closed": 2, "booting": 3, "settling": 4}
+    for _ in range(steps[phase]):
+        _next(sup, world)
+
+
+def _job_file(tmp_path: Path) -> Path:
+    return S.instance_dir(tmp_path, "Pie64") / L.RECYCLE_FILE
+
+
+def _job_data(tmp_path: Path) -> dict:
+    return json.loads(_job_file(tmp_path).read_text(encoding="utf-8"))
+
+
+def _last_data(tmp_path: Path) -> dict:
+    path = S.instance_dir(tmp_path, "Pie64") / L.RECYCLE_LAST_FILE
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _age_job(tmp_path: Path, world: World, seconds: float) -> None:
+    """Rewrite the saved job as ``seconds`` old, as if the supervisor had been down that long."""
+    data = _job_data(tmp_path)
+    data["since"] = (world.now - timedelta(seconds=seconds)).isoformat()
+    _job_file(tmp_path).write_text(json.dumps(data), encoding="utf-8")
+
+
+def _count_probes(sup: Supervisor) -> list:
+    probes: list = []
+    sup._probe = lambda *args, **kwargs: probes.append(args) or True
+    return probes
+
+
+@pytest.mark.parametrize("phase", ["closing", "closed", "booting", "settling"])
+def test_supervisor_restart_resumes_and_launches_once(tmp_path, world, monkeypatch, phase) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, phase)
+    assert _job_file(tmp_path).exists()
+
+    fresh = _reboot(tmp_path, world)
+    pushed, panel = _capture_alerts(fresh, monkeypatch)
+    probes = _count_probes(fresh)
+    for _ in range(12):
+        view = _next(fresh, world)
+        if world.launches:
+            break
+        assert view.desired_reason == "emulator_recycle"
+        assert view.state == InstanceState.SCHEDULED_BREAK
+        assert probes == []  # the closed emulator is never mistaken for an offline one
+
+    assert [n for _, _, n in world.launches] == ["Pie64"]
+    assert len(world.opens) == 1
+    assert len(probes) == 1  # only the ordinary pre-launch probe
+    assert fresh._backoff.misses("Pie64") == 0
+    assert pushed == [] and panel == []
+    assert not _job_file(tmp_path).exists()
+
+
+@pytest.mark.parametrize("phase", ["booting", "settling"])
+def test_resume_reopens_a_player_that_died_meanwhile(tmp_path, world, monkeypatch, phase) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, phase)
+    world.players.clear()
+
+    fresh = _reboot(tmp_path, world)
+    pushed, _panel = _capture_alerts(fresh, monkeypatch)
+    for _ in range(12):
+        _next(fresh, world)
+        if world.launches:
+            break
+    assert len(world.opens) == 2
+    assert len(world.launches) == 1
+    assert pushed == []
+
+
+def test_resume_never_opens_a_second_player_over_a_crash_after_the_open(tmp_path, world) -> None:
+    """The open happened and the supervisor died before anything recorded it."""
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, "closed")
+    world.players["Pie64"] = PLAYER
+
+    fresh = _reboot(tmp_path, world)
+    for _ in range(4):
+        _next(fresh, world)
+    assert world.opens == []
+    assert [n for _, _, n in world.launches] == ["Pie64"]
+
+
+def test_resume_gives_a_boot_a_full_window(tmp_path, world, monkeypatch) -> None:
+    """The boot clock does not fail a job for the minutes nobody was watching."""
+    sup = _guarded(tmp_path, world)
+    world.booted = False
+    _to_phase(sup, world, "booting")
+
+    fresh = _reboot(tmp_path, world)
+    pushed, _panel = _capture_alerts(fresh, monkeypatch)
+    # 360 s since the saved time: a full boot window gone, and still young enough to resume
+    assert _next(fresh, world, 300).desired_reason == "emulator_recycle"
+    for _ in range(5):  # 300 s from the resume
+        assert _next(fresh, world).desired_reason == "emulator_recycle"
+    assert pushed == []
+    assert _next(fresh, world).desired_reason == "emulator_recycle_failed"  # 360 s
+    assert len(pushed) == 1
+    assert len(world.opens) == 1
+
+
+def test_resume_keeps_the_settle_clock(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, "settling")
+    world.now += timedelta(seconds=60)
+
+    fresh = _reboot(tmp_path, world)
+    assert _next(fresh, world).state == InstanceState.STARTING  # 120 s since the boot
+    assert [n for _, _, n in world.launches] == ["Pie64"]
+
+
+def test_a_job_file_from_the_future_is_clamped(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, "settling")
+    data = _job_data(tmp_path)
+    data["since"] = (world.now + timedelta(days=30)).isoformat()
+    _job_file(tmp_path).write_text(json.dumps(data), encoding="utf-8")
+
+    fresh = _reboot(tmp_path, world)
+    _next(fresh, world)
+    assert world.launches == []
+    _next(fresh, world)
+    assert [n for _, _, n in world.launches] == ["Pie64"]
+
+
+def test_stopping_resumes_as_stopping(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    sup.tick()
+    assert _job_data(tmp_path)["phase"] == "stopping"
+
+    fresh = _reboot(tmp_path, world)
+    world.now += timedelta(seconds=30)
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+    view = _view(fresh.tick(), "Pie64")
+    assert view.state == InstanceState.STOPPING
+    assert view.desired_reason == "emulator_recycle"
+    assert (S.instance_dir(tmp_path, "Pie64") / L.STOP_FLAG).exists()
+    assert world.closes == []
+
+    world.alive.discard(WORKER)
+    _next(fresh, world)
+    assert len(world.closes) == 1
+
+
+def test_a_resumed_stopping_job_keeps_the_restart_grace(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    sup.tick()
+
+    fresh = _reboot(tmp_path, world)
+    world.now += timedelta(seconds=30)
+    asked = world.now  # the new supervisor has no ask on record, so its first tick is one
+    _heartbeat(tmp_path, "Pie64", WORKER, asked)
+    deadline = asked + timedelta(seconds=L.RECYCLE_STOP_GRACE_S)
+    assert _view(fresh.tick(), "Pie64").until == deadline
+
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=111))
+    assert _next(fresh, world, 111).state == InstanceState.STOPPING
+    assert world.kills == []
+
+    _next(fresh, world, L.RECYCLE_STOP_GRACE_S - 111)
+    assert world.kills == [WORKER]
+
+
+def test_a_stop_after_the_restart_abandons_a_resumed_stopping_job(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    sup.tick()
+    fresh = _reboot(tmp_path, world)
+    fresh.stop("Pie64")
+    world.alive.discard(WORKER)
+    assert _next(fresh, world).desired_reason == "override_stop"
+    assert world.closes == []
+    assert not _job_file(tmp_path).exists()
+
+
+_RESUME_LIMIT_S = L.BOOT_TIMEOUT_S + L.SETTLE_S
+
+
+@pytest.mark.parametrize("age_s", [_RESUME_LIMIT_S + 1, 6 * 3600])
+@pytest.mark.parametrize("phase", ["closing", "closed", "booting", "settling"])
+def test_a_stale_job_is_dropped_and_never_reopens(
+    tmp_path, world, monkeypatch, caplog, phase, age_s
+) -> None:
+    """A power cut: HD-Player went with everything else and the job is left over."""
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, phase)
+    world.players.clear()
+    opens = len(world.opens)
+    last = _last_data(tmp_path)
+    _age_job(tmp_path, world, age_s)
+
+    fresh = _reboot(tmp_path, world)
+    pushed, panel = _capture_alerts(fresh, monkeypatch)
+    with caplog.at_level("WARNING", logger="brawlfarm.supervisor"):
+        view = _next(fresh, world, 0)
+    assert "too old to resume" in caplog.text
+    assert view.desired_reason != "emulator_recycle"
+    assert "Pie64" not in fresh._recycling
+    assert not _job_file(tmp_path).exists()
+    assert _last_data(tmp_path) == last
+
+    assert [n for _, _, n in world.launches] == ["Pie64"]  # the normal path took over
+    for _ in range(3):
+        _next(fresh, world)
+    assert len(world.opens) == opens
+    assert pushed == [] and panel == []
+
+
+@pytest.mark.parametrize("phase", ["closing", "closed", "booting", "settling"])
+def test_a_stop_wins_over_a_resumed_job(tmp_path, world, monkeypatch, caplog, phase) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, phase)
+    opens, closes = len(world.opens), len(world.closes)
+    players = dict(world.players)
+    last = _last_data(tmp_path)
+
+    fresh = _reboot(tmp_path, world)
+    fresh.stop("Pie64")
+    pushed, panel = _capture_alerts(fresh, monkeypatch)
+    with caplog.at_level("WARNING", logger="brawlfarm.supervisor"):
+        for _ in range(4):
+            view = _next(fresh, world)
+            assert view.state == InstanceState.STOPPED
+            assert view.desired_reason == "override_stop"
+    assert "a stop is wanted" in caplog.text
+    assert "Pie64" not in fresh._recycling
+    assert not _job_file(tmp_path).exists()
+    assert _last_data(tmp_path) == last
+    assert len(world.opens) == opens and len(world.closes) == closes
+    assert world.players == players  # left as it is, closed or open
+    assert world.launches == []
+    assert pushed == [] and panel == []
+
+
+@pytest.mark.parametrize("phase", ["closing", "closed", "booting", "settling"])
+def test_a_job_at_the_age_limit_with_want_run_still_resumes(tmp_path, world, phase) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, phase)
+    world.players.clear()
+    opens = len(world.opens)
+    last = _last_data(tmp_path)
+    _age_job(tmp_path, world, _RESUME_LIMIT_S)
+
+    fresh = _reboot(tmp_path, world)
+    assert _next(fresh, world, 0).desired_reason == "emulator_recycle"
+    assert len(world.opens) == opens + 1
+    assert fresh._recycling["Pie64"].phase == L._Phase.BOOTING
+    assert _job_file(tmp_path).exists()
+    assert _last_data(tmp_path) == last
+
+
+def test_a_dropped_job_keeps_the_thirty_minute_limit(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, "settling")
+    _age_job(tmp_path, world, _RESUME_LIMIT_S + 1)
+
+    fresh = _reboot(tmp_path, world)
+    _next(fresh, world, 0)
+    assert not _job_file(tmp_path).exists()
+    worker = world.procs[-1].pid
+
+    world.now += timedelta(seconds=60)
+    _heartbeat(tmp_path, "Pie64", worker, world.now)
+    assert _view(fresh.tick(), "Pie64").desired_reason != "emulator_recycle"  # 41 GB, too soon
+
+    world.now = T0 + timedelta(seconds=L.MIN_INTERVAL_S)
+    _heartbeat(tmp_path, "Pie64", worker, world.now)
+    assert _view(fresh.tick(), "Pie64").desired_reason == "emulator_recycle"
+
+
+def test_a_stale_stopping_job_keeps_resuming(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.player_gb = 41.0
+    sup.tick()
+    _age_job(tmp_path, world, 6 * 3600)
+
+    fresh = _reboot(tmp_path, world)
+    world.alive.discard(WORKER)
+    assert _next(fresh, world).desired_reason == "emulator_recycle"
+    assert len(world.closes) == 1
+
+
+def test_a_stale_failed_job_stays_failed(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    world.open_ok = False
+    _to_phase(sup, world, "booting")
+    world.open_ok = True
+    _age_job(tmp_path, world, 6 * 3600)
+
+    fresh = _reboot(tmp_path, world)
+    assert _next(fresh, world).desired_reason == "emulator_recycle_failed"
+    assert _job_file(tmp_path).exists()
+
+
+def test_failed_survives_a_restart_until_start(tmp_path, world, monkeypatch) -> None:
+    sup = _guarded(tmp_path, world)
+    world.open_ok = False
+    _to_phase(sup, world, "booting")
+    assert sup._recycling["Pie64"].phase == L._Phase.FAILED
+
+    world.open_ok = True
+    fresh = _reboot(tmp_path, world)
+    pushed, panel = _capture_alerts(fresh, monkeypatch)
+    opens = len(world.opens)
+    for _ in range(4):
+        view = _next(fresh, world)
+        assert view.state == InstanceState.STOPPED
+        assert view.desired_reason == "emulator_recycle_failed"
+    assert len(world.opens) == opens and world.launches == []
+    assert pushed == [] and panel == []  # the one alert already went out
+
+    fresh = _reboot(tmp_path, world)  # and again, this time with Start before any tick
+    fresh.start("Pie64")
+    assert not _job_file(tmp_path).exists()
+    _next(fresh, world)
+    assert [n for _, _, n in world.launches] == ["Pie64"]
+
+
+@pytest.mark.parametrize(
+    "junk",
+    [
+        b"{not json",
+        b"\xff\xfe\x00",
+        b"[]",
+        b"null",
+        b'{"phase": "booting"}',
+        b'{"phase": "nonsense", "since": "2026-09-10T12:00:00"}',
+        b'{"phase": "booting", "since": "yesterday"}',
+        b'{"phase": "booting", "since": 5}',
+        b'{"phase": "booting", "since": "2026-09-10T12:00:00+00:00"}',
+    ],
+)
+def test_a_corrupt_job_file_is_ignored_with_a_log_line(tmp_path, world, caplog, junk) -> None:
+    _job_file(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    _job_file(tmp_path).write_bytes(junk)
+    with caplog.at_level("WARNING", logger="brawlfarm.supervisor"):
+        sup = _reboot(tmp_path, world)
+        view = _view(sup.tick(), "Pie64")
+    assert L.RECYCLE_FILE in caplog.text
+    assert sup._recycling == {}
+    assert view.desired_reason != "emulator_recycle"
+    assert [n for _, _, n in world.launches] == ["Pie64"]
+
+
+def test_a_job_file_write_that_fails_does_not_stop_the_restart(
+    tmp_path, world, monkeypatch, caplog
+) -> None:
+    def refuse(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(L, "atomic_write_json", refuse)
+    sup = _guarded(tmp_path, world)
+    with caplog.at_level("WARNING", logger="brawlfarm.supervisor"):
+        _to_phase(sup, world, "settling")
+    assert sup._recycling["Pie64"].phase == L._Phase.SETTLING
+    assert "disk full" in caplog.text
+
+
+def test_the_job_file_goes_when_the_restart_ends(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    sup.tick()
+    before = _schedule_files(tmp_path)
+    _to_phase(sup, world, "settling")
+    assert _job_file(tmp_path).exists()
+    _next(sup, world)
+    _next(sup, world)
+    assert world.launches != []
+    assert not _job_file(tmp_path).exists()
+    assert _schedule_files(tmp_path) == before
+
+
+def test_thirty_minute_limit_survives_a_restart_after_the_job_ended(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, "settling")
+    _next(sup, world)
+    _next(sup, world)  # done 6 minutes in, and the worker is back
+    assert not _job_file(tmp_path).exists()
+    world.alive.add(WORKER)
+
+    fresh = _reboot(tmp_path, world)
+    world.player_gb = 45.0
+    for _ in range(4):  # 11, 16, 21 and 26 minutes after the first restart began
+        world.now += timedelta(minutes=5)
+        _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+        assert _view(fresh.tick(), "Pie64").state == InstanceState.FARMING
+
+    fresh = _reboot(tmp_path, world)
+    world.now += timedelta(minutes=5)  # 31 minutes
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+    assert _view(fresh.tick(), "Pie64").desired_reason == "emulator_recycle"
+
+
+def test_thirty_minute_limit_survives_a_restart_mid_job_too(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, "closing")
+    fresh = _reboot(tmp_path, world)
+    assert fresh._recycled_at["Pie64"] == T0
+
+
+def test_a_corrupt_last_restart_file_is_ignored(tmp_path, world, caplog) -> None:
+    path = S.instance_dir(tmp_path, "Pie64") / L.RECYCLE_LAST_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"{not json")
+    with caplog.at_level("WARNING", logger="brawlfarm.supervisor"):
+        sup = _reboot(tmp_path, world)
+    assert L.RECYCLE_LAST_FILE in caplog.text
+    assert sup._recycled_at == {}
+
+
+# --- the failed restart's alert ---------------------------------------------------------
+
+
+def test_failed_restart_alert_has_its_own_title(tmp_path, world, monkeypatch) -> None:
+    sup = _guarded(tmp_path, world)  # the default events list; saved lists carry the same kind
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(L.notify, "configured", lambda: True)
+    monkeypatch.setattr(L.notify, "notify", lambda title, msg: sent.append((title, msg)) or True)
+    store = AlertStore()
+    sup.subscribe_alerts(store.add)
+    L.notify.maybe_alert("offline", {"instance": "Rome64"})  # must not swallow what follows
+
+    world.open_ok = False
+    _to_phase(sup, world, "booting")
+
+    assert [title for title, _ in sent] == ["Instance offline", "Emulator restart failed"]
+    assert "step=opening" in sent[-1][1]
+    assert [a.title for a in store._alerts] == ["Emulator restart failed"]
+
+
+def test_an_ordinary_offline_alert_keeps_its_title() -> None:
+    assert L.notify.alert_title("offline") == "Instance offline"
+    assert L.notify.alert_title("offline", {"misses": 3}) == "Instance offline"
+    assert L.notify.alert_title("crash", {"reason": RECYCLE_FAILED_REASON}) == "Bot crashed"
+    assert L.notify.alert_title("offline", {"reason": ["junk"]}) == "Instance offline"
+
+
+# --- a guard step that raises -----------------------------------------------------------
+
+
+def _raises(*args, **kwargs):
+    raise RuntimeError("boom")
+
+
+def test_a_raising_step_fails_the_job_with_one_alert(tmp_path, world, monkeypatch, caplog) -> None:
+    sup = _guarded(tmp_path, world)
+    pushed, panel = _capture_alerts(sup, monkeypatch)
+    _to_phase(sup, world, "booting")
+    sup._boot_done = _raises
+    with caplog.at_level("ERROR", logger="brawlfarm.supervisor"):
+        view = _next(sup, world)
+    assert view.desired_reason == "emulator_recycle_failed"
+    assert view.state == InstanceState.STOPPED
+    assert "boom" in caplog.text
+    _next(sup, world)
+    assert len(pushed) == 1 and len(panel) == 1
+    assert _job_data(tmp_path)["phase"] == "failed"
+
+
+@pytest.mark.parametrize("broken", ["log", "readings", "both"])
+def test_one_alert_when_logging_raises(tmp_path, world, monkeypatch, broken) -> None:
+    sup = _guarded(tmp_path, world)
+    pushed, panel = _capture_alerts(sup, monkeypatch)
+    world.close_ok = False
+    world.player_gb = 41.0
+    sup.tick()
+    world.alive.discard(WORKER)
+    if broken in ("log", "both"):
+        monkeypatch.setattr(L.log, "log", _raises)
+    if broken in ("readings", "both"):
+        sup._private_gb = _raises
+        sup._commit_free_gb = _raises
+    assert _next(sup, world).desired_reason == "emulator_recycle_failed"
+    assert _next(sup, world).desired_reason == "emulator_recycle_failed"
+    assert len(pushed) == 1 and len(panel) == 1
+
+
+def test_a_restart_starts_even_when_its_log_line_raises(tmp_path, world, monkeypatch) -> None:
+    sup = _guarded(tmp_path, world)
+    monkeypatch.setattr(L.log, "log", _raises)
+    world.player_gb = 41.0
+    assert _view(sup.tick(), "Pie64").desired_reason == "emulator_recycle"
+    assert sup._recycling["Pie64"].phase == L._Phase.STOPPING
+
+
+def test_a_raising_push_still_reaches_the_panel_and_keeps_the_tick(
+    tmp_path, world, monkeypatch
+) -> None:
+    sup = _guarded(tmp_path, world)
+    panel: list = []
+    sup.subscribe_alerts(lambda name, kind, fields: panel.append(kind))
+    monkeypatch.setattr(L.notify, "maybe_alert", _raises)
+    world.open_ok = False
+    _to_phase(sup, world, "booting")
+    assert _next(sup, world).desired_reason == "emulator_recycle_failed"
+    assert panel == ["offline"]
+
+
+def test_persistent_raises_in_stopping_never_block_the_graceful_stop(
+    tmp_path, world, monkeypatch
+) -> None:
+    sup = _guarded(tmp_path, world)
+    pushed, _panel = _capture_alerts(sup, monkeypatch)
+    world.player_gb = 41.0
+    sup.tick()
+    sup._find_player = _raises
+    sup._private_gb = _raises
+    sup._commit_free_gb = _raises
+
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=60))
+    assert _next(sup, world).state == InstanceState.STOPPING
+    assert (S.instance_dir(tmp_path, "Pie64") / L.STOP_FLAG).exists()
+    assert pushed == []  # nothing has failed yet: the worker is finishing its match
+
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=L.RECYCLE_STOP_GRACE_S))
+    _next(sup, world, L.RECYCLE_STOP_GRACE_S)
+    assert world.kills == [WORKER]
+
+    view = _next(sup, world)
+    assert view.desired_reason == "emulator_recycle_failed"
+    assert view.state == InstanceState.STOPPED
+    _next(sup, world)
+    assert len(pushed) == 1
+    assert world.launches == []
+
+
+def test_a_stop_in_stopping_abandons_when_the_readings_raise(tmp_path, world, monkeypatch) -> None:
+    sup = _guarded(tmp_path, world)
+    pushed, _panel = _capture_alerts(sup, monkeypatch)
+    world.player_gb = 41.0
+    sup.tick()
+    sup._find_player = _raises
+    sup.stop("Pie64")
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now + timedelta(seconds=60))
+    view = _next(sup, world)
+    assert view.state == InstanceState.STOPPING
+    assert view.desired_reason == "override_stop"
+    assert sup._recycling == {} and pushed == []
+
+
+def test_a_raising_trigger_leaves_a_healthy_farm_alone(tmp_path, world, monkeypatch) -> None:
+    """Nothing has been touched yet, so a broken reading must not take the instance down."""
+    sup = _guarded(tmp_path, world)
+    pushed, _panel = _capture_alerts(sup, monkeypatch)
+    sup._private_gb = _raises
+    view = _view(sup.tick(), "Pie64")
+    assert view.state == InstanceState.FARMING
+    assert sup._recycling == {} and pushed == []
+
+
+# --- instances that leave the settings --------------------------------------------------
+
+
+@pytest.mark.parametrize("phase", ["stopping", "booting"])
+def test_removing_an_instance_drops_its_job_and_files(tmp_path, world, caplog, phase) -> None:
+    sup = make_sup(tmp_path, world)
+    sup.settings.behavior.emulator_recycle_gb = 40.0
+    sup.apply_settings(sup.settings)
+    world.alive |= {WORKER, 2222}
+    world.players["Pie64"] = PLAYER
+    world.player_gb = 41.0
+    _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+    _heartbeat(tmp_path, "Rome64", 2222, world.now)
+    sup.tick()
+    assert _job_file(tmp_path).exists()
+    world.alive.discard(WORKER)
+    if phase == "booting":
+        for _ in range(3):
+            _next(sup, world)
+    opens = len(world.opens)
+
+    keep = _settings(("Rome64",))
+    keep.behavior.emulator_recycle_gb = 40.0
+    sup.apply_settings(keep)
+    with caplog.at_level("WARNING", logger="brawlfarm.supervisor"):
+        views = sup.tick()
+    assert [v.name for v in views] == ["Rome64"]
+    assert "Pie64" not in sup._recycling and "Pie64" not in sup._recycled_at
+    assert not _job_file(tmp_path).exists()
+    assert not (S.instance_dir(tmp_path, "Pie64") / L.RECYCLE_LAST_FILE).exists()
+    assert "Pie64" in caplog.text
+    assert len(world.opens) == opens  # a closed emulator stays closed: nothing owns it now
+
+    sup.apply_settings(_settings())  # back again, with nothing left over
+    assert _view(sup.tick(), "Pie64").desired_reason != "emulator_recycle"
+
+
+def test_instance_removed_while_the_supervisor_was_down(tmp_path, world) -> None:
+    sup = _guarded(tmp_path, world)
+    _to_phase(sup, world, "booting")
+    fresh = make_sup(tmp_path, world, ("Rome64",))
+    fresh.tick()
+    assert fresh._recycling == {}
+    assert not _job_file(tmp_path).exists()
+
+
+# --- a failed commit read ---------------------------------------------------------------
+
+
+def _commit_warnings(caplog) -> int:
+    return sum("commit" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_failed_commit_read_logs_once_then_again_after_it_recovers(tmp_path, world, caplog) -> None:
+    sup = _guarded(tmp_path, world, recycle_gb=0.0, floor_gb=12.0)
+    world.commit_gb = float("inf")
+    with caplog.at_level("WARNING", logger="brawlfarm.supervisor"):
+        for _ in range(4):
+            _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+            _next(sup, world)
+        assert _commit_warnings(caplog) == 1
+
+        world.commit_gb = 100.0
+        _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+        _next(sup, world)
+        world.commit_gb = float("inf")
+        for _ in range(3):
+            _heartbeat(tmp_path, "Pie64", WORKER, world.now)
+            _next(sup, world)
+        assert _commit_warnings(caplog) == 2
+    assert sup._recycling == {}
+
+
+def test_failed_commit_read_stays_quiet_with_no_floor_set(tmp_path, world, caplog) -> None:
+    sup = _guarded(tmp_path, world, recycle_gb=40.0, floor_gb=0.0)
+    world.commit_gb = float("inf")
+    with caplog.at_level("WARNING", logger="brawlfarm.supervisor"):
+        sup.tick()
+    assert _commit_warnings(caplog) == 0

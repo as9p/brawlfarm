@@ -19,8 +19,8 @@ Entry points:
   maybe_alert(kind, fields) -> None
       Convenience used by the data logger: turns a session event (kind + fields)
       into a text alert. Safe to call very often; only ALERT_KINDS actually fire.
-  alert_title(kind) -> str
-      The human title for an alert kind, shared with the control panel's alert list
+  alert_title(kind, fields=None) -> str
+      The human title for an alert, shared with the control panel's alert list
       so a phone notification and the panel name the same event the same way.
   ping_healthchecks() -> bool
       GET the configured healthchecks.io (or compatible) ping URL. The supervisor
@@ -70,6 +70,11 @@ _TITLES = {
     "offline": "Instance offline",
 }
 
+# A title for one reason a kind fires, where the kind's own title would misname the event.
+# A failed emulator restart stays kind "offline" so every saved events list keeps delivering
+# it; the reason is the supervisor's RECYCLE_FAILED_REASON.
+_REASON_TITLES = {("offline", "emulator_recycle_failed"): "Emulator restart failed"}
+
 
 def _ascii(s: str) -> str:
     """Make a value safe for an HTTP header (requests encodes headers as latin-1).
@@ -77,10 +82,11 @@ def _ascii(s: str) -> str:
     return s.encode("ascii", "replace").decode("ascii")
 
 
-def alert_title(kind: str) -> str:
-    """The human title for an alert kind. Shared with the control panel's alert list so a
-    phone notification and the Fleet drawer name the same event the same way."""
-    return _TITLES.get(kind, f"Bot: {kind}")
+def alert_title(kind: str, fields: dict | None = None) -> str:
+    """The human title for an alert. Shared with the control panel's alert list so a phone
+    notification and the Fleet drawer name the same event the same way."""
+    reason = str((fields or {}).get("reason"))
+    return _REASON_TITLES.get((kind, reason)) or _TITLES.get(kind, f"Bot: {kind}")
 
 
 # Explicit settings from the control panel; None means "use the environment".
@@ -245,12 +251,12 @@ def maybe_alert(kind: str, fields: dict) -> None:
     if kind not in ALERT_KINDS or kind not in enabled_events() or not configured():
         return
     now = time.monotonic()
-    last = _last_alert.get(kind)
+    title = alert_title(kind, fields)  # the cooldown key: two titles are two different events
+    last = _last_alert.get(title)
     if last is not None and now - last < _COOLDOWN_S:
         return  # throttle repeats of the same kind (esp. recover loops)
-    _last_alert[kind] = now
+    _last_alert[title] = now
     detail = ", ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
-    title = alert_title(kind)
     ok = notify(title, detail or kind)
     if not ok and not _warned_send_failed:
         # A configured-but-failing backend (typo'd webhook / wrong topic) would

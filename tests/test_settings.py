@@ -37,6 +37,9 @@ def test_defaults_match_the_spec() -> None:
     assert s.behavior.close_game_on_stop is True
     assert s.behavior.dnd_at_start is True
     assert s.behavior.shadow is False
+    assert s.behavior.emulator_recycle_gb == 0.0
+    assert s.behavior.commit_floor_gb == 0.0
+    assert s.behavior.emulator_path == r"C:\Program Files\BlueStacks_nxt\HD-Player.exe"
     assert s.scheduler.default_enabled is True
     assert s.notifications.webhook_url == ""
     assert s.notifications.ntfy_topic == ""
