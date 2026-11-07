@@ -72,8 +72,8 @@ def _set_sort(item_label: str, log) -> bool:
     return True
 
 
-def _set_least_trophies(log) -> None:
-    _set_sort("Least Trophies", log)
+def _set_least_trophies(log) -> bool:
+    return _set_sort("Least Trophies", log)
 
 
 def _exit_to_menu() -> None:
@@ -95,9 +95,9 @@ def _exit_to_menu() -> None:
 def select_lowest_trophy_brawler(log=print) -> str | None:
     """Open BRAWLERS, sort by Least Trophies, force the Quest/Heart filters OFF, then
     select the top-left (lowest-trophy) brawler. Returns the brawler's name (OCR'd from the
-    detail screen), "" if SELECT was tapped but the name didn't read, or None if the select
-    failed and the game still plays what it had. Leaves the game on the main menu. Assumes
-    we start at/near it."""
+    detail screen), or None if the select failed and the game still plays what it had: the
+    sort didn't take or the name didn't read, so SELECT was never tapped. Leaves the game on
+    the main menu. Assumes we start at/near it."""
     adb.tap(*config.BRAWLERS_BUTTON)
     # Poll for the screen instead of a flat 2s wait: proceed the instant it's up (usually
     # <1s), but still allow a slow open before bailing. This trims the dead gap after the
@@ -114,7 +114,12 @@ def select_lowest_trophy_brawler(log=print) -> str | None:
         _exit_to_menu()
         return None
 
-    _set_least_trophies(log)
+    if not _set_least_trophies(log):
+        log("[brawlers] sort didn't take, leaving")
+        adb.tap(*config.BRAWLER_SORT_LABEL)  # close the stray dropdown
+        time.sleep(0.8)
+        _exit_to_menu()
+        return None
     _ensure_toggle_off(config.BRAWLER_QUEST_TOGGLE, "Quest", log)
     _ensure_toggle_off(config.BRAWLER_HEART_TOGGLE, "Heart", log)
 
@@ -123,17 +128,22 @@ def select_lowest_trophy_brawler(log=print) -> str | None:
     time.sleep(1.8)
     screen = adb.screencap()
 
-    # OCR the brawler name (largest non-chrome line near the top) for the log/return value.
+    # OCR the brawler name (largest non-chrome line near the top). No name means nothing
+    # says what the card tap opened, so SELECT would be a blind tap.
     name = _read_brawler_name(screen)
+    if not name:
+        log("[brawlers] brawler name didn't read on the detail screen, leaving")
+        _exit_to_menu()
+        return None
 
     # Tap the fixed SELECT button (OCR mangles the styled label, so we don't OCR it).
     # Idempotent: a greyed "SELECTED" on an already-active brawler is a harmless no-op.
     adb.tap(*config.BRAWLER_SELECT_BUTTON)
     time.sleep(1.2)
-    log(f"[brawlers] selected {name or 'lowest-trophy brawler'}")
+    log(f"[brawlers] selected {name}")
 
     _exit_to_menu()
-    return name or ""
+    return name
 
 
 # --- select BY NAME (farm plan) ------------------------------------------------
@@ -318,8 +328,8 @@ def _detail_name_matches(screen, target_n: str, owned_norm: set[str]) -> tuple[b
 
 
 def _read_brawler_name(screen) -> str | None:
-    """Best-effort: read the selected brawler's name off the detail screen. Skips obvious
-    UI chrome so the log shows the brawler, not a button label."""
+    """Read the brawler's name off the detail screen, None if no line reads as one. Skips
+    obvious UI chrome so a button label never passes for the brawler."""
     chrome = {
         "SELECT",
         "SELECTED",

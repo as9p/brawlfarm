@@ -176,16 +176,17 @@ def test_first_card_tap_lands_on_the_card_art_not_its_side_strip() -> None:
     assert _inside((x, y, x, y), FIRST_CARD_ART)
 
 
-def _lowest(monkeypatch, opened, shown):
-    """Stub everything around select_lowest_trophy_brawler. Returns the taps it made."""
-    taps: list[tuple[int, ...]] = []
+def _lowest(monkeypatch, opened, shown, sorted_ok=True):
+    """Stub everything around select_lowest_trophy_brawler. Returns the taps it made, with
+    "exit" marking each _exit_to_menu call among them."""
+    taps: list[tuple[int, ...] | str] = []
     monkeypatch.setattr(brawlers.adb, "tap", lambda *a: taps.append(a))
     monkeypatch.setattr(brawlers.adb, "screencap", lambda: None)
     monkeypatch.setattr(brawlers, "_on_brawlers_screen", lambda screen: opened)
-    monkeypatch.setattr(brawlers, "_set_sort", lambda item, log: True)
+    monkeypatch.setattr(brawlers, "_set_sort", lambda item, log: sorted_ok)
     monkeypatch.setattr(brawlers, "_ensure_toggle_off", lambda centre, name, log: None)
     monkeypatch.setattr(brawlers, "_read_brawler_name", lambda screen: shown)
-    monkeypatch.setattr(brawlers, "_exit_to_menu", lambda: None)
+    monkeypatch.setattr(brawlers, "_exit_to_menu", lambda: taps.append("exit"))
     monkeypatch.setattr(brawlers.time, "sleep", lambda s: None)
     return taps
 
@@ -199,12 +200,20 @@ def test_lowest_select_returns_none_when_the_screen_never_opens(monkeypatch) -> 
 def test_lowest_select_returns_the_name_it_read(monkeypatch) -> None:
     taps = _lowest(monkeypatch, opened=True, shown="WENDY")
     assert brawlers.select_lowest_trophy_brawler(log=lambda *a: None) == "WENDY"
-    assert taps[-1] == config.BRAWLER_SELECT_BUTTON
+    assert taps == [(110, 415), (273, 255), (213, 818), "exit"]  # BRAWLERS, card, SELECT
 
 
-def test_lowest_select_with_an_unread_name_is_not_a_failure(monkeypatch) -> None:
-    # A skin or a misread can leave the header unreadable after SELECT was tapped, which
-    # is a done select: it must come back different from the None of a failed one.
-    taps = _lowest(monkeypatch, opened=True, shown=None)
-    assert brawlers.select_lowest_trophy_brawler(log=lambda *a: None) == ""
-    assert taps[-1] == config.BRAWLER_SELECT_BUTTON
+def test_lowest_select_failed_sort_taps_no_card_and_no_select(monkeypatch) -> None:
+    # The grid order is unknown, so the top-left card is not known to be the lowest. The
+    # dropdown _set_sort opened is still up: it is closed first, then the exit runs.
+    taps = _lowest(monkeypatch, opened=True, shown="WENDY", sorted_ok=False)
+    assert brawlers.select_lowest_trophy_brawler(log=lambda *a: None) is None
+    assert taps == [(110, 415), (711, 44), "exit"]  # BRAWLERS, close the dropdown
+
+
+@pytest.mark.parametrize("shown", [None, ""])
+def test_lowest_select_with_an_unread_name_taps_no_select(monkeypatch, shown) -> None:
+    # Nothing says what the first-card tap opened, so SELECT would be blind.
+    taps = _lowest(monkeypatch, opened=True, shown=shown)
+    assert brawlers.select_lowest_trophy_brawler(log=lambda *a: None) is None
+    assert taps == [(110, 415), (273, 255), "exit"]  # BRAWLERS, the card

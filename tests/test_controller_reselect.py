@@ -339,11 +339,3 @@ def test_successful_select_captures_the_brawler(monkeypatch):
     assert c._farm_brawler == "WENDY"
     assert any("farm brawler = WENDY" in line for line in logged)
     assert c.dl.events == [("select_brawler", {"brawler": "WENDY"})]
-
-
-def test_select_with_an_unread_name_still_captures_the_brawler(monkeypatch):
-    c, logged = _lowest_select(monkeypatch, lambda log: "")
-    c._do_select_brawler()
-    assert c._farm_brawler == "WENDY"
-    assert any("farm brawler = WENDY" in line for line in logged)
-    assert c.dl.events == [("select_brawler", {"brawler": "WENDY"})]
