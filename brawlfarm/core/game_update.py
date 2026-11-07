@@ -3,7 +3,8 @@
 When a new Brawl Stars client ships, the game opens to an update prompt and never plays.
 ``try_update`` opens the store page, taps "Update" if the page shows one, and waits for
 the installed versionName to change. Every effect comes in through ``Effects``, so the
-flow is tested on fakes. The controller decides when to call it (once per run).
+flow is tested on fakes. The controller decides when to call it (once per run, or again
+after an unreadable version, which settles nothing).
 
 Safety rails: the only tap is an OCR line that equals ``config.STORE_UPDATE_NEEDLE``.
 A line holding a ``config.STORE_NEVER_TAP`` word is never a candidate.
@@ -71,11 +72,13 @@ def _wait_for_store(fx: Effects) -> bool:
 
 
 def try_update(fx: Effects) -> Outcome:
-    """Run the store flow once. Never raises on adb trouble: that is a FAILED outcome."""
+    """Run the store flow once. Never raises on adb trouble: that is a FAILED outcome.
+    An unreadable version is inconclusive, not a failed update: without it an install can
+    not be confirmed, so the store stays closed and the outcome is NO_UPDATE."""
     try:
         old = fx.version()
         if old is None:
-            return Outcome(UpdateResult.FAILED, "version_unreadable")
+            return Outcome(UpdateResult.NO_UPDATE, "version_unreadable")
         fx.open_store()
         if not _wait_for_store(fx):
             return Outcome(UpdateResult.FAILED, "store_not_foreground", old=old)

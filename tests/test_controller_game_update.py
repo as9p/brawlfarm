@@ -11,6 +11,8 @@ from brawlfarm.core import game_update
 from brawlfarm.core.controller import Controller
 from brawlfarm.core.game_update import Outcome, UpdateResult
 
+_real_try_update = game_update.try_update
+
 
 class _DL:
     def __init__(self):
@@ -61,6 +63,20 @@ def _kinds(c):
     return [e for e, _ in c.dl.events]
 
 
+def _ctrl_version_unreadable(monkeypatch):
+    """The real try_update behind recover(), with adb unable to read the version."""
+    c = _ctrl(monkeypatch, Outcome(UpdateResult.NO_UPDATE, "unused"))
+
+    def counted_try_update(fx):
+        c.update_calls += 1
+        return _real_try_update(fx)
+
+    monkeypatch.setattr(controller_mod.game_update, "try_update", counted_try_update)
+    monkeypatch.setattr(controller_mod.adb, "package_version", lambda pkg: None)
+    monkeypatch.setattr(controller_mod.adb, "open_store_page", lambda pkg: c.calls.append("store"))
+    return c
+
+
 def test_first_recovery_does_not_check_the_store(monkeypatch):
     c = _ctrl(monkeypatch, Outcome(UpdateResult.NO_UPDATE, "no_update_button"))
     c.recover("stuck_returning")
@@ -96,6 +112,48 @@ def test_failed_update_stops_the_run_without_relaunch(monkeypatch):
     assert c.stopped == ["update_failed"]
     assert ("update_failed", {"reason": "timeout"}) in c.dl.events
     assert c.calls == ["home"]  # left the store, no force-stop or relaunch
+
+
+def test_unreadable_version_keeps_the_run_going_and_relaunches(monkeypatch):
+    c = _ctrl_version_unreadable(monkeypatch)
+    c.recovery_attempts = 1
+    c.recover("stuck_returning")
+    assert c.stopped == []
+    assert "update_failed" not in _kinds(c)
+    assert ("update_check", {"result": "none", "reason": "version_unreadable"}) in c.dl.events
+    assert c.calls == ["home", "force_stop", "launch"]  # the store never opened
+
+
+def test_unreadable_version_lets_a_later_recovery_cycle_check_again(monkeypatch):
+    c = _ctrl_version_unreadable(monkeypatch)
+    c.recovery_attempts = 1
+    c.recover("stuck_returning")
+    assert c._update_checked is False
+    c.recovery_attempts = 1  # reached the menu (back to 0), then a first recovery
+    c.recover("stuck_returning")
+    assert c.update_calls == 2
+
+
+def test_unreadable_version_checks_once_per_recovery_cycle(monkeypatch):
+    c = _ctrl_version_unreadable(monkeypatch)
+    c.recovery_attempts = 1
+    for _ in range(3):  # attempts 2, 3 and 4
+        c.recover("stuck_returning")
+    assert c.update_calls == 1
+    assert c.stopped == []
+    c.recover("stuck_returning")
+    assert c.update_calls == 1
+    assert c.stopped == ["too_many_recoveries:stuck_returning"]
+
+
+def test_a_readable_no_update_uses_up_the_check(monkeypatch):
+    c = _ctrl(monkeypatch, Outcome(UpdateResult.NO_UPDATE, "no_update_button", old="1.0"))
+    c.recovery_attempts = 1
+    c.recover("stuck_returning")
+    assert c._update_checked is True
+    c.recovery_attempts = 1  # reached the menu (back to 0), then a first recovery
+    c.recover("stuck_returning")
+    assert c.update_calls == 1
 
 
 def test_try_update_crash_counts_as_failed(monkeypatch):
