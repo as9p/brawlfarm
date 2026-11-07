@@ -143,7 +143,9 @@ def _exit_rule(reading: Reading, boxes: Sequence[Box], context: Context) -> Rule
 
 
 def evaluate(reading: Reading, boxes: Sequence[Box], context: Context) -> RuleCalls:
-    """One frame's calls. A rule whose inputs are missing is None."""
+    """One frame's calls. A rule whose inputs are missing is None, and a dead self gets none."""
+    if reading.self_dead:
+        return RuleCalls()
     return RuleCalls(
         centre=_centre_rule(context),
         cubes=_cubes_rule(reading, boxes),

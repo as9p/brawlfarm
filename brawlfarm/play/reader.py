@@ -1,4 +1,4 @@
-"""A pure reader for the in-match HUD: teams left, self health, ammo, cubes, enemy health.
+"""A pure reader for the in-match HUD: teams left, self health, ammo, cubes, enemy health, dead.
 
 ``read(frame, boxes)`` looks at one 1600 x 900 BGR frame and returns a ``Reading``. A field it
 cannot read is None, never a guess. CPU only, numpy and OpenCV only, no device, no network, no
@@ -35,6 +35,19 @@ TEAMS_DIGIT_SIZE = (10, 13)
 TEAMS_LABEL_MIN = 0.92  # in-match 0.956 at the 1st percentile, off-match 0.641 at the 99th
 TEAMS_DIGIT_MIN = 0.9  # in-match 0.952 at the 1st percentile, off-match 0.70 at the 99th
 TEAMS_DIGIT_MARGIN = 0.05  # same run: best minus second best digit
+
+# Dead: two white labels, fixed on screen wherever the camera is. "Back in:" tops the respawn
+# countdown, and "Exit" sits in a button that replaces the controls while the camera watches the
+# rest of the match. The boxes are the extents of the text over 254 and 204 frames, plus 2.
+BACK_LABEL_BOX = (729, 316, 876, 351)
+EXIT_LABEL_BOX = (777, 822, 822, 843)
+BACK_LABEL_SIZE = (48, 11)
+EXIT_LABEL_SIZE = (22, 11)
+# Label on screen 0.947 at the 1st percentile, alive 0.640 at the most. The countdown pops in
+# oversized at its first number and the steady text does not start until it settles; that reads
+# 0.76 to 0.86 here, so the bar sits below it.
+BACK_LABEL_MIN = 0.72
+EXIT_LABEL_MIN = 0.85  # button on screen 0.988 at the 1st percentile, alive 0.645 at the most
 
 # Self unit: a bar 90 wide with a row of three ammo segments under it, all offsets from the bar's
 # top left. Measured on the 129 frames with a full green bar: the bar component is 85 to 92 wide
@@ -190,6 +203,35 @@ _TEAMS_LABEL = """
 ........................................................
 """
 
+# The two dead labels, means over the frames in the boxes' comment.
+_BACK_LABEL = """
+................................................
+.######...............##.........##.............
+.######...............###........##.............
+.##..##...###.....##..##...#.....##..#..##...##.
+.##..##..#####...####.###.##.....##.#######..##.
+.#####......##..#####.#####......##..######..##.
+.##.###..#####..##....#####......##..###.##.....
+.##..######.##..##....#####......##..###.##.....
+.##############.#####.##.###.....##..###.##..##.
+.######..######..####.##..###....##..###.##..##.
+................................................
+"""
+
+_EXIT_LABEL = """
+......................
+.#####........##......
+.#####........#...##..
+.###.............###..
+.###...##.###.##.####.
+.####..#####..##..##..
+.###....####..##..##..
+.###....####..##..##..
+.#####.##.##..##..##..
+.#####.##.###.##..##..
+......................
+"""
+
 
 def _rows(block: str) -> list[str]:
     return block.strip("\n").split("\n")
@@ -212,6 +254,8 @@ def _table(block: str, names: str, h: int, w: int) -> dict[str, np.ndarray]:
 DIGIT_GLYPHS = _table(_DIGITS, "0123456789", GLYPH_H, GLYPH_W)
 TEAMS_GLYPHS = _table(_TEAMS_DIGITS, "1234", TEAMS_DIGIT_SIZE[1], TEAMS_DIGIT_SIZE[0])
 TEAMS_LABEL = np.array([[c == "#" for c in r] for r in _rows(_TEAMS_LABEL)])
+BACK_LABEL = np.array([[c == "#" for c in r] for r in _rows(_BACK_LABEL)])
+EXIT_LABEL = np.array([[c == "#" for c in r] for r in _rows(_EXIT_LABEL)])
 
 
 @dataclass(frozen=True)
@@ -226,6 +270,9 @@ class Reading:
     enemy_health: tuple[int, ...] = ()
     # No steady HUD source exists: no row of teammates was found, only a passing banner.
     teammates_alive: int | None = None
+    # True on a dead label, False on a self bar with no label, None with neither: a label shows a
+    # moment after the death, so a missing bar alone does not say dead.
+    self_dead: bool | None = None
 
 
 class _Masks(NamedTuple):
@@ -396,20 +443,34 @@ def _number(
     return int("".join(d for d in digits if d))
 
 
-def _teams_left(frame: np.ndarray) -> int | None:
-    def scaled(box: tuple[int, int, int, int], size: tuple[int, int]) -> np.ndarray:
-        x0, y0, x1, y1 = box
-        white = (frame[y0:y1, x0:x1].min(axis=2) >= TEAMS_WHITE).astype(np.uint8) * 255
-        return cv2.resize(white, size, interpolation=cv2.INTER_AREA) >= 128
+def _white_text(
+    frame: np.ndarray, box: tuple[int, int, int, int], size: tuple[int, int]
+) -> np.ndarray:
+    x0, y0, x1, y1 = box
+    white = (frame[y0:y1, x0:x1].min(axis=2) >= TEAMS_WHITE).astype(np.uint8) * 255
+    return cv2.resize(white, size, interpolation=cv2.INTER_AREA) >= 128
 
-    if (scaled(TEAMS_LABEL_BOX, TEAMS_LABEL_SIZE) == TEAMS_LABEL).mean() < TEAMS_LABEL_MIN:
+
+def _teams_left(frame: np.ndarray) -> int | None:
+    label = _white_text(frame, TEAMS_LABEL_BOX, TEAMS_LABEL_SIZE)
+    if (label == TEAMS_LABEL).mean() < TEAMS_LABEL_MIN:
         return None
-    digit = scaled(TEAMS_DIGIT_BOX, TEAMS_DIGIT_SIZE)
+    digit = _white_text(frame, TEAMS_DIGIT_BOX, TEAMS_DIGIT_SIZE)
     scores = sorted(((digit == g).mean(), d) for d, g in TEAMS_GLYPHS.items())
     (second, _), (best, name) = scores[-2], scores[-1]
     if best < TEAMS_DIGIT_MIN or best - second < TEAMS_DIGIT_MARGIN:
         return None
     return int(name)
+
+
+def _dead(frame: np.ndarray) -> bool:
+    """Either dead label on screen. These are two small fixed crops, so every frame can afford
+    them, and a watched teammate's bar in the middle of the screen must not hide them."""
+    back = _white_text(frame, BACK_LABEL_BOX, BACK_LABEL_SIZE)
+    if (back == BACK_LABEL).mean() >= BACK_LABEL_MIN:
+        return True
+    leave = _white_text(frame, EXIT_LABEL_BOX, EXIT_LABEL_SIZE)
+    return bool((leave == EXIT_LABEL).mean() >= EXIT_LABEL_MIN)
 
 
 def _cube_count(hsv: np.ndarray, anchor: _Anchor) -> int | None:
@@ -489,9 +550,12 @@ def read(frame: np.ndarray, boxes: Sequence[Box] = ()) -> Reading:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     masks = _masks(hsv)
     teams = _teams_left(frame)
+    dead = _dead(frame)
     found = _self(frame, masks, boxes)
     if found is None:
-        return Reading(teams_left=teams, enemy_health=_enemies(frame, masks, None))
+        return Reading(
+            teams_left=teams, enemy_health=_enemies(frame, masks, None), self_dead=dead or None
+        )
     anchor, health, fill = found
     return Reading(
         teams_left=teams,
@@ -500,4 +564,5 @@ def read(frame: np.ndarray, boxes: Sequence[Box] = ()) -> Reading:
         self_ammo=_ammo(masks, anchor) if anchor.strip else None,
         cube_count=_cube_count(hsv, anchor),
         enemy_health=_enemies(frame, masks, anchor),
+        self_dead=dead,
     )
