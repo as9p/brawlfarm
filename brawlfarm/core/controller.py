@@ -951,14 +951,19 @@ class Controller:
         except Exception as e:
             self.dl.event("select_brawler_error", err=repr(e))
             self.log(f"brawler select error: {e!r}")
-            self._capture_farm_brawler()
+            return
+        if ocr_name is None:
+            # The game still plays what it had, so _farm_brawler stays as it is: the API's
+            # lowest would be a brawler nobody is playing.
+            self.dl.event("select_brawler_error", err="lowest-trophy select failed")
+            self.log("lowest-trophy select failed -> keeping the current farm brawler")
             return
         self._capture_farm_brawler()
         # v4 §12 (TANUKI fix): the detail screen header shows the EQUIPPED SKIN's
         # name ("TANUKI"), not necessarily the brawler ("SPROUT") — prefer the
         # API-canonical lowest-trophy name just captured for the narration event
         # (checklist label + farming record); the OCR text is the fallback only.
-        name = self._farm_brawler or ocr_name
+        name = self._farm_brawler or ocr_name or None
         self.dl.event("select_brawler", brawler=name)
 
     def _do_set_dnd(self) -> None:

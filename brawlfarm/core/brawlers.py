@@ -95,7 +95,9 @@ def _exit_to_menu() -> None:
 def select_lowest_trophy_brawler(log=print) -> str | None:
     """Open BRAWLERS, sort by Least Trophies, force the Quest/Heart filters OFF, then
     select the top-left (lowest-trophy) brawler. Returns the brawler's name (OCR'd from the
-    detail screen) or None. Leaves the game on the main menu. Assumes we start at/near it."""
+    detail screen), "" if SELECT was tapped but the name didn't read, or None if the select
+    failed and the game still plays what it had. Leaves the game on the main menu. Assumes
+    we start at/near it."""
     adb.tap(*config.BRAWLERS_BUTTON)
     # Poll for the screen instead of a flat 2s wait: proceed the instant it's up (usually
     # <1s), but still allow a slow open before bailing. This trims the dead gap after the
@@ -131,7 +133,7 @@ def select_lowest_trophy_brawler(log=print) -> str | None:
     log(f"[brawlers] selected {name or 'lowest-trophy brawler'}")
 
     _exit_to_menu()
-    return name
+    return name or ""
 
 
 # --- select BY NAME (farm plan) ------------------------------------------------

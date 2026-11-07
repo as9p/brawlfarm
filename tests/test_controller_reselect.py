@@ -287,3 +287,63 @@ def test_no_double_fire_once_pending(monkeypatch):
     c._check_farm_brawler_trophies(_player(("CROW", 336), ("NEW", 0)))
     assert c._reselect_pending is True  # unchanged, no re-log
     assert c.dl.events == []
+
+
+class _Api:
+    """The roster the API reports: WENDY is the lowest, whatever the game has selected."""
+
+    def get_player(self):
+        return {"brawlers": [{"name": "VINCE", "trophies": 300}, {"name": "WENDY", "trophies": 0}]}
+
+
+def _lowest_select(monkeypatch, select):
+    """A controller on VINCE that takes the lowest-trophy path, with the real capture.
+    Returns (controller, log lines)."""
+    from brawlfarm.core import brawlers
+
+    monkeypatch.setattr(farmplan, "resolve_target", lambda api, exclude=(): (None, 1000, []))
+    monkeypatch.setattr(farmplan, "load_plan", lambda: _ladder_plan())
+    monkeypatch.setattr(brawlers, "select_lowest_trophy_brawler", select)
+    logged = []
+    c = _ctrl(farm_brawler="VINCE")
+    c._quest_aware = False
+    c.api = _Api()
+    c.log = logged.append
+    return c, logged
+
+
+def test_failed_select_keeps_the_farm_brawler(monkeypatch):
+    # The select never reached the card, so the game is still on VINCE: taking the API's
+    # lowest here would watch a brawler nobody is playing.
+    c, logged = _lowest_select(monkeypatch, lambda log: None)
+    c._do_select_brawler()
+    assert c._farm_brawler == "VINCE"
+    assert not any("farm brawler =" in line for line in logged)
+    assert [e for e, _ in c.dl.events] == ["select_brawler_error"]
+
+
+def test_select_that_raises_keeps_the_farm_brawler(monkeypatch):
+    def boom(log):
+        raise RuntimeError("adb down")
+
+    c, logged = _lowest_select(monkeypatch, boom)
+    c._do_select_brawler()
+    assert c._farm_brawler == "VINCE"
+    assert not any("farm brawler =" in line for line in logged)
+    assert [e for e, _ in c.dl.events] == ["select_brawler_error"]
+
+
+def test_successful_select_captures_the_brawler(monkeypatch):
+    c, logged = _lowest_select(monkeypatch, lambda log: "WENDY")
+    c._do_select_brawler()
+    assert c._farm_brawler == "WENDY"
+    assert any("farm brawler = WENDY" in line for line in logged)
+    assert c.dl.events == [("select_brawler", {"brawler": "WENDY"})]
+
+
+def test_select_with_an_unread_name_still_captures_the_brawler(monkeypatch):
+    c, logged = _lowest_select(monkeypatch, lambda log: "")
+    c._do_select_brawler()
+    assert c._farm_brawler == "WENDY"
+    assert any("farm brawler = WENDY" in line for line in logged)
+    assert c.dl.events == [("select_brawler", {"brawler": "WENDY"})]

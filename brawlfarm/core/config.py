@@ -472,8 +472,9 @@ HANDLER_REPEAT_MAX = 4
 # so the farm plays it. Like the shop/pass actions: open from menu -> act -> exit via taps.
 # ⚠️ Coordinates calibrated live on 5585 (1600x900); the brawler UI can shift between updates.
 BRAWLERS_BUTTON = (110, 415)  # left-side menu BRAWLERS button (label OCR'd ~85,429)
-# was (0, 0, 900, 80); "BRAWLERS 105/107" text (277,103,540,136) on 0006, 10 px margin
-BRAWLERS_HEADER_REGION = (267, 93, 550, 146)  # OCR "BRAWLERS" here to confirm the screen is open
+# was (267, 93, 550, 146), which cut the word down to "RS108/108"; "BRAWLERS 108/108" text
+# about (150,105,420,135) on capture-20261107 frames 01779 and 01780
+BRAWLERS_HEADER_REGION = (100, 90, 560, 150)  # OCR "BRAWLERS" here to confirm the screen is open
 
 # was (1010, 42); "Least Trophies" text box (627,32,795,56) on 0006, "Name" centres on the
 # same x on 0066
@@ -497,9 +498,9 @@ BRAWLER_TOGGLE_ORANGE_HI = (22, 255, 255)
 BRAWLER_TOGGLE_ON_FRAC = 0.07  # orange fraction in a toggle's box above this => it's ON
 BRAWLER_TOGGLE_HALF = 45  # half-size of the box sampled around each toggle's center
 
-# was (330, 300); top-left card centre at the resting scroll offset, 0015 (column 0 spans
-# x 277 to 637, row 1 spans y 147 to 364)
-BRAWLER_FIRST_CARD = (457, 255)  # top-left grid card center = lowest after the sort
+# was (457, 255), now the green strip beside the art; top-left card art at the resting
+# scroll offset, x 127 to 420, y 155 to 335 on capture-20261107 frame 01779
+BRAWLER_FIRST_CARD = (273, 255)  # top-left grid card art center = lowest after the sort
 # Brawler detail screen: the blue SELECT button sits at a FIXED bottom-left spot, far from
 # the TRY button and the bottom-right UPGRADE button (Gems/Coins, never tapped). OCR mangles
 # the styled label ("SELET"), so we tap the fixed coordinate; tapping is idempotent (an
