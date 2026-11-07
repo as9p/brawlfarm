@@ -1308,7 +1308,10 @@ class Controller:
                 if self._bush_logged is not None:
                     self._bush_logged = None  # left bush behavior -> allow a fresh log
             self.last_move = now
-            self._last_move_kind = action.kind if action is not None else "wander"
+            if action is not None:
+                self._last_move_kind = action.kind
+            else:  # None is the switch being off or a detector failure: only the log tells them apart
+                self._last_move_kind = "wander" if config.BUSH_HIDE else "wander_off"
             self._move_gap = random.uniform(config.MOVE_INTERVAL_MIN, config.MOVE_INTERVAL_MAX)
         if now - self.last_attack >= self._attack_gap:
             self.tap(self._jitter(config.ATTACK_POINT))  # auto-aim attack (slight pos jitter)

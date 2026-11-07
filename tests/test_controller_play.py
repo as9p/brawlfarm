@@ -149,6 +149,7 @@ def test_the_tick_works_on_a_controller_without_the_move_attributes(monkeypatch)
 
 def _mover(monkeypatch, action):
     """A controller whose next in-match tick is a move tick and nothing else."""
+    monkeypatch.setattr(config, "BUSH_HIDE", True)
     monkeypatch.setattr(config, "GAS_AWARE", False)
     monkeypatch.setattr(config, "ABILITY_BUTTONS_ENABLED", False)
     monkeypatch.setattr(config, "INGAME_MODAL_CHECK_EVERY", 1000)
@@ -225,6 +226,53 @@ def test_a_wander_records_its_heading_and_no_target(monkeypatch) -> None:
     assert c._last_move_target is None
     assert len(c.swipes) == 1
     assert _swiped_heading(c.swipes[0]) == pytest.approx(1.5, abs=0.02)
+
+
+def _bush_ticker(monkeypatch, bush_clusters):
+    """A _swiper running the real _bush_action too, so a test sees the switch and the detector
+    decide the logged kind, with a wander's random draws scripted."""
+    c = _swiper(monkeypatch, None, uniforms=[0.5, 1.0, 1.0])
+    del c._bush_action
+    c._heading = 1.0
+    monkeypatch.setattr(controller_mod.match_vision, "bush_clusters", bush_clusters)
+    return c
+
+
+def _assert_wandered(c) -> None:
+    assert c._last_move_heading == 1.5
+    assert c._last_move_target is None
+    assert len(c.swipes) == 1
+    assert _swiped_heading(c.swipes[0]) == pytest.approx(1.5, abs=0.02)
+
+
+def test_a_move_tick_with_the_bush_switch_off_logs_wander_off(monkeypatch) -> None:
+    def detector_must_not_run(screen):
+        raise AssertionError("the switch is off")
+
+    c = _bush_ticker(monkeypatch, detector_must_not_run)
+    monkeypatch.setattr(config, "BUSH_HIDE", False)
+    c.phase_playing(None, State.IN_MATCH)
+    assert c._last_move_kind == "wander_off"
+    assert c.dl.events == []  # a detector run would have logged bush_error
+    _assert_wandered(c)
+
+
+def test_a_move_tick_that_found_no_bush_logs_wander(monkeypatch) -> None:
+    c = _bush_ticker(monkeypatch, lambda screen: [])
+    c.phase_playing(None, State.IN_MATCH)
+    assert c._last_move_kind == "wander"
+    _assert_wandered(c)
+
+
+def test_a_move_tick_whose_detector_failed_logs_wander(monkeypatch) -> None:
+    def detector_fails(screen):
+        raise RuntimeError("cv trouble")
+
+    c = _bush_ticker(monkeypatch, detector_fails)
+    c.phase_playing(None, State.IN_MATCH)
+    assert c._last_move_kind == "wander"
+    assert [etype for etype, _ in c.dl.events] == ["bush_error"]
+    _assert_wandered(c)
 
 
 @pytest.mark.parametrize("kind", ["hide", "relocate"])
