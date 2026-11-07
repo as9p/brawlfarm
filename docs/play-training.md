@@ -447,6 +447,15 @@ the same reasons are printed under the verdict. Three tap anchors have no templa
 detection of one is listed as unverified for you to check by hand, and they never change the
 verdict.
 
+The templates say nothing about the **in-match classes** (`self`, `enemy`, `teammate`,
+`power_cube`, `box`, `bush`), so those are scored against the labels of the test split instead,
+one table for live captures and one for YouTube, since one video can make up most of the split.
+A source whose name starts with `yt-` is YouTube and anything else is live. The report lists
+frames per group and, per class, truth (the labelled boxes), true positives, false positives,
+misses, precision and recall under `sources` in `score.json`, and marks a class with fewer than
+`--min-truth` labelled boxes in a group as too little truth to read. These tables never change
+the verdict or the exit code, and a folder scan has no labels, so it leaves them out.
+
 `--root` picks the dataset root and `--models` the folder holding `play.onnx` (default
 `models/`). `--min-truth` is how many template boxes a tap anchor needs before its recall
 counts (default 30), and `--min-recall` is the recall it must then reach (default 0.5).

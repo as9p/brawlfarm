@@ -18,11 +18,12 @@ import numpy as np
 import pytest
 
 from brawlfarm.core.vision import Match
-from tools.play import classes, dataset, score
+from tools.play import classes, coco, dataset, score
 
 PLAY = classes.CLASSES.index("play_button")
 CLOSE = classes.CLASSES.index("close_x")
 SKULL = classes.CLASSES.index("skull_star")
+ENEMY = classes.CLASSES.index("enemy")
 HASH = "0123456789abcdef"
 # the tap anchors a template labels: the only ones whose misses the report can count
 LABELLED = sorted(classes.TEMPLATE_CLASS.values())
@@ -620,3 +621,257 @@ def test_main_with_cuda_stops_before_scoring_anything_on_the_cpu(tmp_path, monke
 
     assert "play-gpu" in str(stopped.value)
     assert not (root / "models" / "score.json").exists()
+
+
+LIVE_FRAME = "session-000001.jpg"
+VIDEO_FRAME = "yt-AAAAAAAAAAA-000001.jpg"
+# where a model that says (ENEMY, 0.9, (0.3, 0.5, 0.1, 0.1)) puts its box, and somewhere else
+ON_DETECTION = [400, 405, 160, 90]
+OFF_DETECTION = [1200, 100, 160, 90]
+
+
+def _label(cls: str, bbox: list[int]) -> dict:
+    x, y, w, h = bbox
+    return {"class_index": classes.category_id(cls) - 1, "x": x, "y": y, "w": w, "h": h}
+
+
+def _enemy(sc: float = 0.9, *, bbox: list[int] = ON_DETECTION) -> dict:
+    return _box("enemy", *bbox, sc) | {"class_index": ENEMY}
+
+
+def _write_labelled_coco(root: Path, labels: dict[str, list[tuple[str, list[int]]]]) -> None:
+    """A build whose test split holds these frames, each with these (class, bbox) labels."""
+    test = root / "coco" / "test"
+    test.mkdir(parents=True)
+    images, annotations = [], []
+    for number, (name, boxes) in enumerate(labels.items(), start=1):
+        cv2.imwrite(str(test / name), _frame())
+        images.append(
+            {"id": number, "file_name": name, "width": dataset.FRAME_W, "height": dataset.FRAME_H}
+        )
+        for cls, bbox in boxes:
+            annotations.append(
+                {
+                    "id": len(annotations) + 1,
+                    "image_id": number,
+                    "category_id": classes.category_id(cls),
+                    "bbox": bbox,
+                    "area": bbox[2] * bbox[3],
+                    "iscrowd": 0,
+                }
+            )
+    (test / "_annotations.coco.json").write_text(
+        json.dumps({"images": images, "annotations": annotations, "categories": []}),
+        encoding="utf-8",
+    )
+    (root / "coco" / "split.json").write_text(
+        json.dumps({"smoke": False, "training_set_hash": HASH}), encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "group"),
+    [
+        (VIDEO_FRAME, score.YOUTUBE),
+        (f"{coco.YOUTUBE_PREFIX}-AAAAAAAAAA-000002.jpg", score.YOUTUBE),
+        (LIVE_FRAME, score.LIVE),
+        ("20260916-101500-000001.jpg", score.LIVE),
+        ("myt-000001.jpg", score.LIVE),
+        ("youtube-000001.jpg", score.LIVE),
+    ],
+)
+def test_source_group_goes_by_the_youtube_prefix_of_the_file_name(name, group):
+    assert score.source_group(name) == group
+
+
+def test_the_in_match_classes_are_the_ones_no_tap_anchor_covers():
+    assert score.IN_MATCH == ("self", "enemy", "teammate", "power_cube", "box", "bush")
+
+
+def test_tally_counts_a_hit_a_miss_and_an_invention():
+    labels = [_label("enemy", ON_DETECTION), _label("enemy", [100, 100, 160, 90])]
+
+    counts = score.tally([_enemy(), _enemy(0.8, bbox=OFF_DETECTION)], labels)
+
+    assert counts["enemy"] == {"tp": 1, "fp": 1, "fn": 1}
+    assert counts["self"] == {"tp": 0, "fp": 0, "fn": 0}
+
+
+def test_tally_counts_a_second_box_on_one_object_as_a_false_positive():
+    counts = score.tally([_enemy(), _enemy(0.8)], [_label("enemy", ON_DETECTION)])
+
+    assert counts["enemy"] == {"tp": 1, "fp": 1, "fn": 0}
+
+
+def test_tally_never_matches_a_box_to_a_label_of_another_class():
+    counts = score.tally([_enemy()], [_label("teammate", ON_DETECTION)])
+
+    assert counts["enemy"] == {"tp": 0, "fp": 1, "fn": 0}
+    assert counts["teammate"] == {"tp": 0, "fp": 0, "fn": 1}
+
+
+def test_tally_leaves_a_tap_anchor_out():
+    assert "play_button" not in score.tally([_box("play_button", 0, 0, 10, 10)], [])
+
+
+def test_by_source_keeps_the_groups_apart():
+    hit = score.tally([_enemy()], [_label("enemy", ON_DETECTION)])
+    miss = score.tally([], [_label("enemy", ON_DETECTION)])
+    invented = score.tally([_enemy()], [])
+
+    sources = score.by_source(
+        {score.LIVE: [hit, miss], score.YOUTUBE: [hit, hit, hit, invented]}, min_truth=1
+    )
+
+    assert sources[score.LIVE]["frames"] == 2
+    assert sources[score.LIVE]["classes"]["enemy"] == {
+        "truth": 2,
+        "tp": 1,
+        "fp": 0,
+        "fn": 1,
+        "precision": 1.0,
+        "recall": 0.5,
+        "enough_truth": True,
+    }
+    assert sources[score.YOUTUBE]["frames"] == 4
+    assert sources[score.YOUTUBE]["classes"]["enemy"] == {
+        "truth": 3,
+        "tp": 3,
+        "fp": 1,
+        "fn": 0,
+        "precision": 0.75,
+        "recall": 1.0,
+        "enough_truth": True,
+    }
+
+
+def test_by_source_says_a_class_has_too_little_truth_below_the_minimum_and_not_at_it():
+    hit = score.tally([_enemy()], [_label("enemy", ON_DETECTION)])
+
+    below = score.by_source({score.LIVE: [hit] * 2}, min_truth=3)[score.LIVE]["classes"]
+    at = score.by_source({score.LIVE: [hit] * 3}, min_truth=3)[score.LIVE]["classes"]
+
+    assert below["enemy"]["enough_truth"] is False
+    assert at["enemy"]["enough_truth"] is True
+
+
+def test_by_source_reports_nothing_measured_as_zero_and_too_little_truth():
+    count = score.by_source({score.LIVE: []})[score.LIVE]
+
+    assert count["frames"] == 0
+    assert set(count["classes"]) == set(score.IN_MATCH)
+    assert count["classes"]["enemy"] == {
+        "truth": 0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "enough_truth": False,
+    }
+
+
+def test_main_scores_live_captures_apart_from_youtube(tmp_path, monkeypatch, capsys):
+    _write_labelled_coco(
+        tmp_path / "root",
+        {
+            LIVE_FRAME: [("enemy", ON_DETECTION)],
+            VIDEO_FRAME: [("enemy", OFF_DETECTION), ("bush", OFF_DETECTION)],
+        },
+    )
+    session = _session([(ENEMY, 0.9, (0.3, 0.5, 0.1, 0.1))])
+
+    _code, written = _main(
+        tmp_path, monkeypatch, session, _meta({"enemy": 0.5}), _finder({}), "--min-truth", "2"
+    )
+
+    live, youtube = written["sources"]["live"], written["sources"]["youtube"]
+    assert live["frames"] == 1 and youtube["frames"] == 1
+    assert live["classes"]["enemy"] == {
+        "truth": 1,
+        "tp": 1,
+        "fp": 0,
+        "fn": 0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "enough_truth": False,
+    }
+    assert youtube["classes"]["enemy"] == {
+        "truth": 1,
+        "tp": 0,
+        "fp": 1,
+        "fn": 1,
+        "precision": 0.0,
+        "recall": 0.0,
+        "enough_truth": False,
+    }
+    assert youtube["classes"]["bush"]["fn"] == 1
+    assert "too little truth, under 2" in capsys.readouterr().out
+
+
+def test_main_counts_only_the_frames_it_scored(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    _write_labelled_coco(root, {LIVE_FRAME: [("enemy", ON_DETECTION)]})
+    cv2.imwrite(str(root / "coco" / "test" / LIVE_FRAME), _frame(450, 800))
+
+    _code, written = _main(tmp_path, monkeypatch, _session([]), _meta({}), _finder({}))
+
+    assert written["frames"] == {"scored": 0, "skipped": 1}
+    assert written["sources"]["live"]["frames"] == 0
+    assert written["sources"]["live"]["classes"]["enemy"]["truth"] == 0
+
+
+def test_main_says_when_a_group_has_no_frames(tmp_path, monkeypatch, capsys):
+    _write_labelled_coco(tmp_path / "root", {LIVE_FRAME: []})
+
+    _main(tmp_path, monkeypatch, _session([]), _meta({}), _finder({}))
+
+    assert "youtube  no frames scored" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("templates_see_it", "flags", "verdict"),
+    [
+        (True, ("--min-truth", "1"), "PASS"),
+        (True, (), "INCONCLUSIVE"),
+        (False, ("--min-truth", "1"), "FAIL"),
+    ],
+)
+def test_main_keeps_its_verdict_whatever_the_in_match_numbers_say(
+    tmp_path, monkeypatch, templates_see_it, flags, verdict
+):
+    """The in-match labels are all missed here, and the run has to end as it would without them."""
+    runs = []
+    for folder, labels in (("bare", []), ("labelled", [("enemy", OFF_DETECTION)] * 40)):
+        _write_labelled_coco(tmp_path / folder / "root", {LIVE_FRAME: labels, VIDEO_FRAME: labels})
+        session, meta, find = _all_found()
+        find = find if templates_see_it else _finder({})
+        runs.append(_main(tmp_path / folder, monkeypatch, session, meta, find, *flags))
+
+    (bare_code, bare), (labelled_code, labelled) = runs
+    assert labelled["verdict"] == bare["verdict"] == verdict
+    assert labelled_code == bare_code == score.EXIT_CODES[verdict]
+    for key in ("pass", "fail_reasons", "inconclusive_reasons", "classes", "tap_anchors"):
+        assert labelled[key] == bare[key]
+    assert labelled["sources"]["live"]["classes"]["enemy"]["recall"] == 0.0
+
+
+def test_main_folder_scan_has_no_labels_to_report(tmp_path, monkeypatch, capsys):
+    _write_frames(tmp_path / "shots")
+    session, meta, find = _all_found()
+
+    _code, written = _main(
+        tmp_path, monkeypatch, session, meta, find, "--frames", str(tmp_path / "shots")
+    )
+
+    assert written["sources"] is None
+    assert "a folder scan has no labels" in capsys.readouterr().out
+
+
+def test_main_without_a_coco_build_has_no_labels_to_report(tmp_path, monkeypatch):
+    session, meta, find = _all_found()
+
+    code, written = _main(tmp_path, monkeypatch, session, meta, find)
+
+    assert code == 2
+    assert written["sources"] is None
