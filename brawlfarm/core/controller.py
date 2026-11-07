@@ -153,6 +153,7 @@ class Controller:
         self._results_taps = 0  # consecutive advance_results taps without progress
         self.popup_count = 0
         self.last_move = 0.0
+        self._last_move_kind: str | None = None  # the last move tick's decision, for shadow rows
         # In-match anti-detection state: a continuously-wandering heading + per-action
         # randomized gaps, re-rolled each time we act so the attack/move cadence and the
         # movement direction never settle into a detectable repeating pattern.
@@ -1086,6 +1087,7 @@ class Controller:
         match, so the gas state is still true."""
         self.set_phase("playing")
         self.last_attack = self.last_move = 0.0
+        self._last_move_kind = None
         self._gas.reset()
         self._gas_edges = set()
         # Phase B: bush/relocation state must not leak across matches either.
@@ -1295,6 +1297,7 @@ class Controller:
                 if self._bush_logged is not None:
                     self._bush_logged = None  # left bush behavior -> allow a fresh log
             self.last_move = now
+            self._last_move_kind = action.kind if action is not None else "wander"
             self._move_gap = random.uniform(config.MOVE_INTERVAL_MIN, config.MOVE_INTERVAL_MAX)
         if now - self.last_attack >= self._attack_gap:
             self.tap(self._jitter(config.ATTACK_POINT))  # auto-aim attack (slight pos jitter)
@@ -1704,7 +1707,13 @@ class Controller:
                 from brawlfarm.play import session
 
                 self.play = session.PlaySession()
-            for kind, fields in self.play.observe(state, self.phase):
+            rows = self.play.observe(
+                state,
+                self.phase,
+                farm_move=getattr(self, "_last_move_kind", None),
+                moved_at=getattr(self, "last_move", None),
+            )
+            for kind, fields in rows:
                 self.dl.event(kind, **fields)
         except Exception as e:
             self._play_off = True

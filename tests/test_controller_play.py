@@ -12,11 +12,13 @@ exactly the config flag and the session stub.
 
 import subprocess
 import sys
+import time
 
 import pytest
 
 from brawlfarm.core import config
 from brawlfarm.core.controller import Controller
+from brawlfarm.core.match_vision import BushAction
 from brawlfarm.core.states import State
 
 
@@ -38,12 +40,14 @@ class _Session:
         self.close_rows = close_rows or []
         self.boom = boom
         self.ticks = []
+        self.moves = []
         self.closed = 0
 
-    def observe(self, state, phase):
+    def observe(self, state, phase, **move):
         if self.boom:
             raise RuntimeError("shadow blew up")
         self.ticks.append((state, phase))
+        self.moves.append(move)
         return self.rows
 
     def close(self):
@@ -84,7 +88,7 @@ def test_shadow_on_builds_the_session_once(monkeypatch) -> None:
             built.append(self)
             self.ticks = []
 
-        def observe(self, state, phase):
+        def observe(self, state, phase, **move):
             self.ticks.append((state, phase))
             return []
 
@@ -108,6 +112,83 @@ def test_the_rows_reach_the_datalog_in_order(monkeypatch) -> None:
     c._play_observe(State.IN_MATCH)
     assert c.dl.events == rows
     assert session.ticks == [(State.IN_MATCH, "playing")]
+
+
+def test_the_tick_hands_the_session_the_last_move(monkeypatch) -> None:
+    monkeypatch.setattr(config, "PLAY_SHADOW", True)
+    play = _Session()
+    c = _ctrl(play)
+    c._last_move_kind = "relocate"
+    c.last_move = 12.5
+    c._play_observe(State.IN_MATCH)
+    assert play.moves == [{"farm_move": "relocate", "moved_at": 12.5}]
+    assert c._play_off is False
+
+
+def test_the_tick_works_on_a_controller_without_the_move_attributes(monkeypatch) -> None:
+    monkeypatch.setattr(config, "PLAY_SHADOW", True)
+    play = _Session()
+    c = _ctrl(play)  # built without __init__: no last_move, no _last_move_kind
+    c._play_observe(State.IN_MATCH)
+    assert play.moves == [{"farm_move": None, "moved_at": None}]
+    assert c._play_off is False
+
+
+def _mover(monkeypatch, action):
+    """A controller whose next in-match tick is a move tick and nothing else."""
+    monkeypatch.setattr(config, "GAS_AWARE", False)
+    monkeypatch.setattr(config, "ABILITY_BUTTONS_ENABLED", False)
+    monkeypatch.setattr(config, "INGAME_MODAL_CHECK_EVERY", 1000)
+    c = _ctrl()
+    c.phase_started = time.monotonic()
+    c._playing_modal_i = 0
+    c._bush_logged = None
+    c.last_move = c.last_attack = 0.0
+    c._move_gap = 0.0
+    c._attack_gap = float("inf")
+    c._bush_action = lambda screen, gas_fr: action
+    c._steer_to_bush = lambda *args: None
+    c._wander_move = lambda gas_fr: None
+    return c
+
+
+@pytest.mark.parametrize(
+    ("action", "kind"),
+    [
+        (None, "wander"),
+        (BushAction("wander"), "wander"),
+        (BushAction("hide", target=(1, 2)), "hide"),
+        (BushAction("relocate", target=(1, 2)), "relocate"),
+    ],
+)
+def test_a_move_tick_records_what_it_decided(monkeypatch, action, kind) -> None:
+    c = _mover(monkeypatch, action)
+    c.phase_playing(None, State.IN_MATCH)
+    assert c._last_move_kind == kind
+    assert c.last_move > 0.0
+
+
+def test_a_tick_with_no_move_due_keeps_the_last_kind(monkeypatch) -> None:
+    c = _mover(monkeypatch, BushAction("hide", target=(1, 2)))
+    c._last_move_kind = "wander"
+    c._move_gap = float("inf")
+    c.phase_playing(None, State.IN_MATCH)
+    assert c._last_move_kind == "wander"
+
+
+def test_a_new_match_forgets_the_last_move() -> None:
+    """The tick after entry reaches the session before the farm's first move of this match."""
+
+    class _Gas:
+        def reset(self):
+            pass
+
+    c = _ctrl()
+    c.set_phase = lambda name: None
+    c._gas = _Gas()
+    c._last_move_kind = "hide"
+    c._enter_match()
+    assert c._last_move_kind is None
 
 
 def test_a_raising_session_turns_shadow_off_after_one_line(monkeypatch) -> None:

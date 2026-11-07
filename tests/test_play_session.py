@@ -7,6 +7,7 @@ so the reads are deterministic: the fake clock only moves when a test moves it.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import subprocess
 import sys
@@ -238,7 +239,18 @@ def test_the_happy_path_writes_a_file_and_reports_on_and_a_summary(h: Harness, t
     assert len(lines) == 4
     assert set(lines[0]) == HEADER_KEYS
     assert lines[0]["classes"] == ["enemy", "bush"] and lines[0]["rate_hz"] == session.RATE_HZ
-    assert set(lines[1]) == {"t", "age", "ms", "boxes", "rules_ms", "read", "rules", "farm"}
+    assert set(lines[1]) == {
+        "t",
+        "age",
+        "ms",
+        "boxes",
+        "rules_ms",
+        "read",
+        "rules",
+        "farm",
+        "farm_move",
+        "farm_move_age",
+    }
     assert lines[1]["boxes"] == [["enemy", 0.912, 10, 20, 30, 40], ["bush", 0.555, 1, 2, 3, 4]]
     assert h.sources[0].stopped and not h.session.active
 
@@ -519,6 +531,43 @@ def test_a_row_carries_the_reader_the_rules_and_the_farm_label(h, tmp_path, monk
     assert row["boxes"][0] == ["self", 0.9, 780, 430, 40, 40]
 
 
+def test_a_row_carries_the_farm_move_and_how_long_ago_it_was(h, tmp_path) -> None:
+    h.session.observe(State.IN_MATCH, "playing", farm_move="hide", moved_at=99.5)
+    h.now[0] += 0.25
+    h.run()
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+
+    row = rows_of(tmp_path, done)[0]
+    assert row["farm_move"] == "hide" and row["farm_move_age"] == 0.75
+
+
+def test_a_caller_with_no_move_writes_nulls(h, tmp_path) -> None:
+    h.session.observe(State.IN_MATCH, "playing")
+    h.run()
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+
+    row = rows_of(tmp_path, done)[0]
+    assert row["farm_move"] is None and row["farm_move_age"] is None
+
+
+def test_a_farm_that_has_not_moved_yet_has_no_age(h, tmp_path) -> None:
+    """last_move starts at 0.0 and a rejoin puts it back, so that value is not a time."""
+    h.session.observe(State.IN_MATCH, "playing", farm_move="wander", moved_at=0.0)
+    h.run()
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+
+    row = rows_of(tmp_path, done)[0]
+    assert row["farm_move"] == "wander" and row["farm_move_age"] is None
+
+
+def test_the_session_defaults_to_the_clock_the_controller_reads() -> None:
+    """moved_at is a controller time, and the controller passes no clock of its own."""
+    assert inspect.signature(session.PlaySession).parameters["clock"].default is time.monotonic
+
+
 def test_the_real_reader_runs_on_a_blank_frame_and_reads_nothing(h, tmp_path) -> None:
     h.session.observe(State.IN_MATCH, "playing")
     h.run()
@@ -622,11 +671,55 @@ def test_a_reader_that_raises_costs_the_fields_and_not_the_session(
     assert kinds(events) == ["play_on", "play_summary"]
     done = dict(events)["play_summary"]
     assert done["frames"] == 3 and done["rules_errors"] == 3
-    assert done["coverage"] == {} and done["rule_calls"] == {}
+    assert set(done["coverage"].values()) == {0.0} and done["rule_calls"] == {}
     rows = rows_of(tmp_path, done)
     assert [(row["read"], row["rules"]) for row in rows] == [(None, None)] * 3
     assert rows[0]["boxes"] and rows[0]["farm"]["state"] == "in_match"
     assert len([r for r in caplog.records if "rules error" in r.getMessage()]) == 1
+
+
+def test_coverage_names_every_field_when_no_read_ever_landed(h, monkeypatch) -> None:
+    monkeypatch.setattr(reader, "read", boom)
+    h.session.observe(State.IN_MATCH, "playing")
+    h.run(ticks=2)
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+
+    assert done["coverage"] == {
+        "teams_left": 0.0,
+        "self_health": 0.0,
+        "self_health_fraction": 0.0,
+        "self_ammo": 0.0,
+        "cube_count": 0.0,
+        "enemy_health": 0.0,
+        "teammates_alive": 0.0,
+    }
+
+
+def test_a_reader_failure_ages_the_enemy_window_as_an_empty_frame(h, monkeypatch) -> None:
+    """One read, a full window of failures, one read. Every frame holds an enemy box, so only
+    the failures counting as empty frames can leave the last read with 1 and not 2 or more."""
+    script = [READING, *[None] * rules.ENEMY_WINDOW, READING]
+    seen = []
+
+    def scripted(frame, boxes):
+        reading = script.pop(0)
+        if reading is None:
+            raise RuntimeError("bad read")
+        return reading
+
+    real = rules.evaluate
+
+    def spy(reading, boxes, context):
+        seen.append(context.enemy_recent)
+        return real(reading, boxes, context)
+
+    monkeypatch.setattr(reader, "read", scripted)
+    monkeypatch.setattr(rules, "evaluate", spy)
+    h.session.observe(State.IN_MATCH, "playing")
+    h.run(ticks=rules.ENEMY_WINDOW + 2)
+
+    assert seen == [1, 1]
 
 
 def test_rules_that_raise_keep_the_reading_and_the_session(h, tmp_path, monkeypatch) -> None:

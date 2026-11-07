@@ -7,8 +7,10 @@ sends no input, it never touches the datalog, and it never raises into the loop:
 its events to a list under a lock and the controller thread drains them from ``observe()``.
 
 Each row also carries what ``brawlfarm.play.reader`` read from that frame and what
-``brawlfarm.play.rules`` would call on it. Those fields only ever add to a row: ``ms`` is still
-the detector alone, and a reader or rules error costs the fields of that row, never the session.
+``brawlfarm.play.rules`` would call on it, beside what the farm itself last did, so a call can
+be compared with the move it would have replaced. Those fields only ever add to a row: ``ms`` is
+still the detector alone, and a reader or rules error costs the fields of that row, never the
+session.
 
 The controller never waits for that thread either. The end of a match sets the stop flag and
 returns; the thread stops the source, closes the file and queues its summary on its way out, and
@@ -58,6 +60,14 @@ def _plain(value: Any) -> Any:
     if isinstance(value, float | np.floating):
         return round(float(value), 3)
     return int(value)
+
+
+def _coverage(hits: dict[str, int], frames: int) -> dict[str, float]:
+    """The share of frames each reader field was read on. Every field is named: one that was
+    never hit says 0.0, also when the reader failed on every frame and left ``hits`` empty."""
+    from brawlfarm.play import reader
+
+    return {field: round(hits.get(field, 0) / frames, 3) for field in asdict(reader.Reading())}
 
 
 def _default_source() -> Any:
@@ -123,7 +133,8 @@ class PlaySession:
         self._read_hits: dict[str, int] = {}
         self._rule_calls: dict[str, int] = {}
         self._rules_errors = 0
-        self._farm: tuple[str, str, float] | None = None  # state, phase, clock at the last tick
+        # state, phase, clock at the last tick, then the kind and time of the farm's last move
+        self._farm: tuple[str, str, float, str | None, float | None] | None = None
         self._enemy_frames: deque[bool] = deque(maxlen=rules.ENEMY_WINDOW)
         self._file: Any = None
         self._file_name = ""
@@ -146,10 +157,22 @@ class PlaySession:
 
     # -- the controller thread ---------------------------------------------------
 
-    def observe(self, state: State, phase: str) -> list[Event]:
-        """One controller tick. Returns the feed rows the controller writes."""
+    def observe(
+        self,
+        state: State,
+        phase: str,
+        *,
+        farm_move: str | None = None,
+        moved_at: float | None = None,
+    ) -> list[Event]:
+        """One controller tick. Returns the feed rows the controller writes.
+
+        ``farm_move`` is what the farm's last move tick decided. ``moved_at`` is when, on this
+        session's clock: the controller reads ``time.monotonic``, the default here, and it builds
+        the only session that ever gets the value. 0.0 is the controller's "not moved yet".
+        """
         try:
-            self._observe(state, phase)
+            self._observe(state, phase, farm_move, moved_at)
         except Exception as exc:  # shadow mode must never stop the farm loop
             log.warning("shadow session error: %s", exc)
             self._await_stop = True
@@ -175,9 +198,11 @@ class PlaySession:
             self._queue("play_fallback", reason="session_error", detail=repr(exc))
         return self._drain()
 
-    def _observe(self, state: State, phase: str) -> None:
+    def _observe(
+        self, state: State, phase: str, farm_move: str | None, moved_at: float | None
+    ) -> None:
         with self._lock:
-            self._farm = (state.value, phase, self._clock())
+            self._farm = (state.value, phase, self._clock(), farm_move, moved_at)
         playing = phase == "playing"
         match_over = not playing or state in matchrec.STOP_STATES
         if self._running:
@@ -284,7 +309,7 @@ class PlaySession:
             file=name,
             rules_ms_p50=round(float(np.percentile(rules_ms, 50)), 1) if rules_ms else 0.0,
             rules_ms_p95=round(float(np.percentile(rules_ms, 95)), 1) if rules_ms else 0.0,
-            coverage={field: round(hit / frames, 3) for field, hit in hits.items()},
+            coverage=_coverage(hits, frames),
             rule_calls=rule_calls,
             rules_errors=rules_errors,
         )
@@ -416,12 +441,13 @@ class PlaySession:
         read: dict[str, Any] | None = None
         calls: dict[str, Any] | None = None
         failed = None
+        self._enemy_frames.append(False)  # a frame the reader fails on still ages the window
         try:
             from brawlfarm.play import reader  # cv2 is heavy and shadow mode alone pays
 
             reading = reader.read(frame, boxes)
             read = {field: _plain(value) for field, value in asdict(reading).items()}
-            self._enemy_frames.append(any(box.cls == "enemy" for box in boxes))
+            self._enemy_frames[-1] = any(box.cls == "enemy" for box in boxes)
             context = rules.Context(enemy_recent=sum(self._enemy_frames))
             calls = asdict(rules.evaluate(reading, boxes, context))
         except Exception as exc:
@@ -443,11 +469,16 @@ class PlaySession:
             "read": read,
             "rules": calls,
             "farm": None,
+            "farm_move": None,
+            "farm_move_age": None,
         }
         if farm is not None:
-            # the label the farm's last tick gave; what it then tapped never reaches this session
-            state, phase, seen = farm
+            # the label the farm's last tick gave and its last move; its taps never reach here
+            state, phase, seen, move, moved_at = farm
             added["farm"] = {"state": state, "phase": phase, "age": round(self._clock() - seen, 3)}
+            added["farm_move"] = move
+            if moved_at:
+                added["farm_move_age"] = round(self._clock() - moved_at, 3)
         return added
 
     # -- the file ----------------------------------------------------------------
