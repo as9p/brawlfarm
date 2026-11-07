@@ -36,6 +36,25 @@ def test_nothing_known_is_three_nones() -> None:
     assert evaluate() == RuleCalls(centre=None, cubes=None, exit=None)
 
 
+@pytest.mark.parametrize("self_dead", [False, None])
+def test_a_live_or_unread_self_keeps_every_call(self_dead) -> None:
+    boxes = (ME, box("power_cube", 850, 450), ENEMY_RIGHT, BUSH_LEFT)
+    reading = Reading(enemy_health=(1200,), self_dead=self_dead)
+    calls = evaluate(boxes, reading, Context(in_centre=True, gas_forced=True, enemy_recent=5))
+    assert calls == RuleCalls(
+        centre=RuleCall("centre_ok", "gas_forced"),
+        cubes=RuleCall("take_cube", "cube_near"),
+        exit=RuleCall("engage_ok", "bush_exit"),
+    )
+
+
+def test_a_dead_self_gets_no_call_from_any_rule() -> None:
+    boxes = (ME, box("power_cube", 850, 450), ENEMY_RIGHT, BUSH_LEFT)
+    reading = Reading(enemy_health=(1200,), self_dead=True)
+    calls = evaluate(boxes, reading, Context(in_centre=True, gas_forced=True, enemy_recent=5))
+    assert calls == RuleCalls()
+
+
 # -- rule 2, the centre ------------------------------------------------------------
 
 

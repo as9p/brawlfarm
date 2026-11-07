@@ -58,17 +58,16 @@ def text(
         x += m.shape[1] + 3
 
 
-def teams(frame: np.ndarray, value: int | None = 3) -> None:
-    def put(box: tuple[int, int, int, int], table: np.ndarray) -> None:
-        x0, y0, x1, y1 = box
-        big = cv2.resize(
-            table.astype(np.uint8), (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST
-        )
-        frame[y0:y1, x0:x1][big > 0] = WHITE
+def put(frame: np.ndarray, box: tuple[int, int, int, int], table: np.ndarray) -> None:
+    x0, y0, x1, y1 = box
+    big = cv2.resize(table.astype(np.uint8), (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST)
+    frame[y0:y1, x0:x1][big > 0] = WHITE
 
-    put(reader.TEAMS_LABEL_BOX, reader.TEAMS_LABEL)
+
+def teams(frame: np.ndarray, value: int | None = 3) -> None:
+    put(frame, reader.TEAMS_LABEL_BOX, reader.TEAMS_LABEL)
     if value is not None:
-        put(reader.TEAMS_DIGIT_BOX, reader.TEAMS_GLYPHS[str(value)])
+        put(frame, reader.TEAMS_DIGIT_BOX, reader.TEAMS_GLYPHS[str(value)])
 
 
 def self_unit(
@@ -356,6 +355,61 @@ def test_teammates_alive_has_no_source() -> None:
     teams(frame)
     self_unit(frame)
     assert reader.read(frame).teammates_alive is None
+
+
+DEAD_LABELS = [
+    (reader.BACK_LABEL_BOX, reader.BACK_LABEL),
+    (reader.EXIT_LABEL_BOX, reader.EXIT_LABEL),
+]
+
+
+@pytest.mark.parametrize(("box", "table"), DEAD_LABELS)
+def test_a_dead_label_reads_dead_with_no_bar(box, table) -> None:
+    frame = blank()
+    teams(frame)
+    put(frame, box, table)
+    reading = reader.read(frame)
+    assert reading.self_dead is True
+    assert reading.teams_left == 3
+    assert reading.self_health is None
+
+
+@pytest.mark.parametrize(("box", "table"), DEAD_LABELS)
+def test_a_dead_label_beats_a_bar_on_screen(box, table) -> None:
+    """A watched teammate's bar sits where ours would."""
+    frame = blank()
+    self_unit(frame)
+    put(frame, box, table)
+    assert reader.read(frame).self_dead is True
+
+
+def test_a_self_bar_with_no_label_is_alive() -> None:
+    frame = blank()  # the bar's digits land inside the Back in box
+    teams(frame)
+    self_unit(frame)
+    assert reader.read(frame).self_dead is False
+
+
+@pytest.mark.parametrize("floor", [FLOOR, WHITE, BLACK])
+def test_no_bar_and_no_label_is_not_read(floor: tuple[int, ...]) -> None:
+    frame = blank(floor)
+    teams(frame)
+    assert reader.read(frame).self_dead is None
+
+
+def test_the_countdown_popping_in_oversized_still_reads_dead() -> None:
+    x0, y0, x1, y1 = reader.BACK_LABEL_BOX
+    frame = blank()
+    put(frame, (x0 - 3, y0 - 1, x1 + 3, y1 + 1), reader.BACK_LABEL)
+    assert reader.read(frame).self_dead is True
+
+
+@pytest.mark.parametrize(("box", "table"), DEAD_LABELS)
+def test_a_label_off_its_spot_is_not_dead(box, table) -> None:
+    x0, y0, x1, y1 = box
+    frame = blank()
+    put(frame, (x0 + 200, y0 - 100, x1 + 200, y1 - 100), table)
+    assert reader.read(frame).self_dead is None
 
 
 def test_read_leaves_the_frame_alone() -> None:

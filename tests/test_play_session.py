@@ -521,6 +521,7 @@ def test_a_row_carries_the_reader_the_rules_and_the_farm_label(h, tmp_path, monk
         "cube_count": 2,
         "enemy_health": [1000, 800],
         "teammates_alive": None,
+        "self_dead": None,
     }
     assert row["rules"] == {
         "centre": None,
@@ -608,6 +609,21 @@ def test_rules_ms_times_the_reader_and_the_rules_and_ms_stays_the_detector(
     assert done["ms_p50"] == 0.0
 
 
+def test_a_dead_reading_lands_in_the_row_and_stops_the_rules(h, monkeypatch, tmp_path) -> None:
+    reading_is(monkeypatch, reader.Reading(teams_left=4, self_dead=True))
+    h.detector.boxes = SELF_AND_CUBE
+    h.session.observe(State.IN_MATCH, "playing")
+    h.run(ticks=1)
+
+    done = dict(h.session.observe(State.RESULTS, "playing"))["play_summary"]
+
+    row = rows_of(tmp_path, done)[0]
+    assert row["read"]["self_dead"] == 1
+    assert row["rules"] == {"centre": None, "cubes": None, "exit": None}
+    assert done["coverage"]["self_dead"] == 1.0
+    assert done["rule_calls"] == {"centre": 0, "cubes": 0, "exit": 0}
+
+
 def test_the_summary_has_coverage_per_field_and_calls_per_rule(h, monkeypatch) -> None:
     bare = reader.Reading(teams_left=4)
     reading_is(monkeypatch, READING, bare, bare, bare)
@@ -625,6 +641,7 @@ def test_the_summary_has_coverage_per_field_and_calls_per_rule(h, monkeypatch) -
         "cube_count": 0.25,
         "enemy_health": 0.25,  # an empty tuple is nothing read
         "teammates_alive": 0.0,
+        "self_dead": 0.0,
     }
     assert done["rule_calls"] == {"centre": 0, "cubes": 4, "exit": 0}
     assert done["rules_errors"] == 0
@@ -693,6 +710,7 @@ def test_coverage_names_every_field_when_no_read_ever_landed(h, monkeypatch) -> 
         "cube_count": 0.0,
         "enemy_health": 0.0,
         "teammates_alive": 0.0,
+        "self_dead": 0.0,
     }
 
 
