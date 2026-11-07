@@ -100,6 +100,11 @@ def fixed_boxes(bars: list[brawlers.Bar]) -> list[dict]:
     return [brawlers.fallback_box(bar, dataset.FRAME_W, dataset.FRAME_H) for bar in bars]
 
 
+def fallback_enemies(boxes: list[dict]) -> int:
+    """How many of a frame's final boxes are enemies SAM found no body for."""
+    return sum(1 for box in boxes if box["class"] == "enemy" and box.get("fallback"))
+
+
 def checkpoint_line(file: str, labels: FrameLabels) -> str:
     """One pass1.jsonl line: everything the later passes need for a frame, and no OCR text."""
     return json.dumps(
@@ -293,9 +298,19 @@ def main(argv: list[str] | None = None) -> int:
     tasks = []
     per_class: Counter[str] = Counter()
     fixed = 0
+    dropped = 0
+    left_out = 0
     for row, labels in kept:
         brawler = brawlers.suppress(boxes.get(row["file"], []))
         merged = merge(labels.template, labels.terrain + brawler, _zone(row, exclusions))
+        # A fixed square is often off the body, and without it the frame would teach "no enemy
+        # here", so a SAM miss costs the frame: coco.py only sees frames that have a task. A
+        # --no-sam run has nothing but fixed boxes, so there they stay.
+        missed = 0 if args.no_sam else fallback_enemies(merged)
+        if missed:
+            dropped += missed
+            left_out += 1
+            continue
         per_class.update(box["class"] for box in merged)
         fixed += sum(1 for box in merged if box.get("fallback"))
         tasks.append(prelabel.task_for(row["file"], merged, model_version=MODEL_VERSION))
@@ -311,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(tasks)} frames, {matched} in a match, {missing} missing, {failed} failed, "
         f"{fixed} fixed brawler boxes"
     )
+    print(f"{dropped} fallback enemy boxes dropped, {left_out} frames left out for them")
     print(f"{resumed} frames from the checkpoint, {sam_done} SAM frames already done")
     # Every class, zeros included: a class the run never drew is the thing to notice.
     for cls in classes.CLASSES:

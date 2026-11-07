@@ -356,3 +356,53 @@ def test_run_segment_passes_resume_only_when_asked(tmp_path, monkeypatch, resume
     autolabel.run_segment(tmp_path, prompts, out, "some-model", resume=resume)
     assert calls[0][:2] == ["uv", "run"]
     assert ("--resume" in calls[0]) is resume
+
+
+def _fake_sam(rels, boxes):
+    def run(root, prompts, out, model, resume=False):
+        out.write_text(json.dumps({"file": rels[0], "boxes": boxes}) + "\n", encoding="utf-8")
+
+    return run
+
+
+def _box(cls, x, *, fallback):
+    return {
+        "class": cls,
+        "x": x,
+        "y": 310,
+        "w": 90,
+        "h": 95,
+        "score": 0.3 if fallback else 0.9,
+        "fallback": fallback,
+    }
+
+
+def _sam_run(tmp_path, monkeypatch, boxes):
+    rels = _dataset(tmp_path, n=1)
+    monkeypatch.setattr(prelabel, "boxes_for", lambda frame, **kw: [])
+    monkeypatch.setattr(autolabel, "ocr_engine", lambda: _FakeOcr([]))
+    monkeypatch.setattr(brawlers, "classify", lambda *a, **k: [ENEMY])
+    monkeypatch.setattr(autolabel, "run_segment", _fake_sam(rels, boxes))
+    assert autolabel.main(["--root", str(tmp_path)]) == 0
+    return rels
+
+
+def test_a_frame_with_a_fallback_enemy_is_left_out_and_counted(tmp_path, monkeypatch, capsys):
+    boxes = [_box("enemy", 600, fallback=True), _box("enemy", 1000, fallback=False)]
+    _sam_run(tmp_path, monkeypatch, boxes)
+    assert _tasks(tmp_path) == []
+    out = capsys.readouterr().out
+    assert "1 fallback enemy boxes dropped, 1 frames left out" in out
+    assert "  enemy 0\n" in out
+
+
+def test_a_fallback_box_of_another_class_keeps_its_frame(tmp_path, monkeypatch, capsys):
+    rels = _sam_run(tmp_path, monkeypatch, [_box("teammate", 600, fallback=True)])
+    labels = coco.from_labelstudio(_tasks(tmp_path), use_predictions=True)
+    assert labels == {rels[0]: [{"class": "teammate", "x": 600, "y": 310, "w": 90, "h": 95}]}
+    assert "0 fallback enemy boxes dropped, 0 frames left out" in capsys.readouterr().out
+
+
+def test_a_fallback_enemy_a_zone_drops_keeps_its_frame(tmp_path, monkeypatch):
+    rels = _sam_run(tmp_path, monkeypatch, [{**_box("enemy", 1400, fallback=True), "y": 700}])
+    assert coco.from_labelstudio(_tasks(tmp_path), use_predictions=True) == {rels[0]: []}
