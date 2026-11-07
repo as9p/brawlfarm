@@ -1,7 +1,7 @@
 """Offline coverage of the HUD reader over a folder of frames. Reads images, writes one JSON file
-outside the repository, prints the coverage per field and the two checks that need no labels:
-bar fill against the digits on the same frame, and teams left never rising within a match. Runs
-on the CPU, one process, at most two OpenCV threads.
+outside the repository, prints the coverage per field, the frames read as dead and the two checks
+that need no labels: bar fill against the digits on the same frame, and teams left never rising
+within a match. Runs on the CPU, one process, at most two OpenCV threads.
 
     uv run python tools/play/reader_check.py FRAMES --out OUT.json
     uv run python tools/play/reader_check.py FRAMES --boxes det.jsonl --out OUT.json
@@ -112,6 +112,9 @@ def _report(rows: list[dict[str, Any]], gap: int) -> None:
         print(f"{field:22s} {got:5d} of {total} ({100 * got / max(total, 1):.1f}%)")
     got = sum(bool(r["enemy_health"]) for r in rows)
     print(f"{'enemy_health':22s} {got:5d} of {total} ({100 * got / max(total, 1):.1f}%)")
+    # Not coverage: False is a read too, a live self, so only True counts as a dead frame.
+    got = sum(r["self_dead"] is True for r in rows)
+    print(f"{'self_dead True':22s} {got:5d} of {total} ({100 * got / max(total, 1):.1f}%)")
     matches = split_matches(rows, gap)
     rises = teams_rises(matches)
     print(f"matches {len(matches)}, teams left rises {len(rises)}: {rises[:10]}")
