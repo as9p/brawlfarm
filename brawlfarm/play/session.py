@@ -6,6 +6,12 @@ thread behind it starts the frame source, loads the detector, reads the newest f
 sends no input, it never touches the datalog, and it never raises into the loop: the thread hands
 its events to a list under a lock and the controller thread drains them from ``observe()``.
 
+Each row also carries what ``brawlfarm.play.reader`` read from that frame and what
+``brawlfarm.play.rules`` would call on it, beside what the farm itself last did, so a call can
+be compared with the move it would have replaced. Those fields only ever add to a row: ``ms`` is
+still the detector alone, and a reader or rules error costs the fields of that row, never the
+session.
+
 The controller never waits for that thread either. The end of a match sets the stop flag and
 returns; the thread stops the source, closes the file and queues its summary on its way out, and
 the controller drains that row on a later tick. Only ``close()``, at process shutdown, joins.
@@ -21,7 +27,9 @@ import json
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,7 +37,7 @@ from typing import Any
 import numpy as np
 
 from brawlfarm.core.states import State
-from brawlfarm.play import matchrec
+from brawlfarm.play import matchrec, rules
 
 log = logging.getLogger("brawlfarm.play.session")
 
@@ -41,6 +49,25 @@ KEEP_FILES = 50  # newest shadow files kept per instance
 JOIN_TIMEOUT = 3.0  # seconds close() waits for the thread; no other caller waits at all
 
 Event = tuple[str, dict]
+
+
+def _plain(value: Any) -> Any:
+    """A reader value as JSON takes it: a numpy scalar would stop the row at json.dumps."""
+    if value is None:
+        return None
+    if isinstance(value, tuple):
+        return [_plain(item) for item in value]
+    if isinstance(value, float | np.floating):
+        return round(float(value), 3)
+    return int(value)
+
+
+def _coverage(hits: dict[str, int], frames: int) -> dict[str, float]:
+    """The share of frames each reader field was read on. Every field is named: one that was
+    never hit says 0.0, also when the reader failed on every frame and left ``hits`` empty."""
+    from brawlfarm.play import reader
+
+    return {field: round(hits.get(field, 0) / frames, 3) for field in asdict(reader.Reading())}
 
 
 def _default_source() -> Any:
@@ -102,6 +129,13 @@ class PlaySession:
         self._ms: list[float] = []
         self._stale_ticks = 0
         self._counts: dict[str, int] = {}
+        self._rules_ms: list[float] = []
+        self._read_hits: dict[str, int] = {}
+        self._rule_calls: dict[str, int] = {}
+        self._rules_errors = 0
+        # state, phase, clock at the last tick, then the kind and time of the farm's last move
+        self._farm: tuple[str, str, float, str | None, float | None] | None = None
+        self._enemy_frames: deque[bool] = deque(maxlen=rules.ENEMY_WINDOW)
         self._file: Any = None
         self._file_name = ""
 
@@ -123,10 +157,22 @@ class PlaySession:
 
     # -- the controller thread ---------------------------------------------------
 
-    def observe(self, state: State, phase: str) -> list[Event]:
-        """One controller tick. Returns the feed rows the controller writes."""
+    def observe(
+        self,
+        state: State,
+        phase: str,
+        *,
+        farm_move: str | None = None,
+        moved_at: float | None = None,
+    ) -> list[Event]:
+        """One controller tick. Returns the feed rows the controller writes.
+
+        ``farm_move`` is what the farm's last move tick decided. ``moved_at`` is when, on this
+        session's clock: the controller reads ``time.monotonic``, the default here, and it builds
+        the only session that ever gets the value. 0.0 is the controller's "not moved yet".
+        """
         try:
-            self._observe(state, phase)
+            self._observe(state, phase, farm_move, moved_at)
         except Exception as exc:  # shadow mode must never stop the farm loop
             log.warning("shadow session error: %s", exc)
             self._await_stop = True
@@ -152,7 +198,11 @@ class PlaySession:
             self._queue("play_fallback", reason="session_error", detail=repr(exc))
         return self._drain()
 
-    def _observe(self, state: State, phase: str) -> None:
+    def _observe(
+        self, state: State, phase: str, farm_move: str | None, moved_at: float | None
+    ) -> None:
+        with self._lock:
+            self._farm = (state.value, phase, self._clock(), farm_move, moved_at)
         playing = phase == "playing"
         match_over = not playing or state in matchrec.STOP_STATES
         if self._running:
@@ -182,7 +232,12 @@ class PlaySession:
             self._ms = []
             self._stale_ticks = 0
             self._counts = {}
+            self._rules_ms = []
+            self._read_hits = {}
+            self._rule_calls = {}
+            self._rules_errors = 0
             self._torn_down = False
+        self._enemy_frames.clear()
         self._started_at = self._clock()
         self._last_fresh = self._started_at
         self._stop_flag.clear()
@@ -236,6 +291,8 @@ class PlaySession:
         with self._lock:
             frames, ms, stale = self._frames, list(self._ms), self._stale_ticks
             counts, name, failed = dict(self._counts), self._file_name, self._failed
+            rules_ms, hits = list(self._rules_ms), dict(self._read_hits)
+            rule_calls, rules_errors = dict(self._rule_calls), self._rules_errors
         if frames == 0:
             # nothing was ever inferred: a failed start says so in its fallback already
             return
@@ -250,6 +307,11 @@ class PlaySession:
             stale_ticks=stale,
             boxes=counts,
             file=name,
+            rules_ms_p50=round(float(np.percentile(rules_ms, 50)), 1) if rules_ms else 0.0,
+            rules_ms_p95=round(float(np.percentile(rules_ms, 95)), 1) if rules_ms else 0.0,
+            coverage=_coverage(hits, frames),
+            rule_calls=rule_calls,
+            rules_errors=rules_errors,
         )
         if failed is not None:
             log.info("shadow session ended early (%s) after %d frames", failed, frames)
@@ -352,12 +414,13 @@ class PlaySession:
             "t": round(self._clock() - self._started_at, 3),
             "age": round(age, 3),
             "ms": round(ms, 1),
-            # boxes and timings only: no pixels, no names, no tags
+            # boxes, timings and HUD numbers only: no pixels, no names, no tags
             "boxes": [
                 [box.cls, round(box.score, 3), int(box.x), int(box.y), int(box.w), int(box.h)]
                 for box in boxes
             ],
         }
+        row.update(self._judge(frame, boxes))
         self._write(row)
         with self._lock:
             self._frames += 1
@@ -365,6 +428,58 @@ class PlaySession:
             for box in boxes:
                 self._counts[box.cls] = self._counts.get(box.cls, 0) + 1
         return True
+
+    def _judge(self, frame: np.ndarray, boxes: list[Any]) -> dict:
+        """The reader and the rules on this tick's frame: the row's added fields.
+
+        Everything that can raise stays inside the try, the turn into plain values included,
+        because an error here must cost this row's fields and not reach ``_run``, which would
+        end the session. ``read`` and ``rules`` are None for a row they did not finish. Only
+        the first error of a session is logged: at 5 Hz the rest would bury the log.
+        """
+        at = self._clock()
+        read: dict[str, Any] | None = None
+        calls: dict[str, Any] | None = None
+        failed = None
+        self._enemy_frames.append(False)  # a frame the reader fails on still ages the window
+        try:
+            from brawlfarm.play import reader  # cv2 is heavy and shadow mode alone pays
+
+            reading = reader.read(frame, boxes)
+            read = {field: _plain(value) for field, value in asdict(reading).items()}
+            self._enemy_frames[-1] = any(box.cls == "enemy" for box in boxes)
+            context = rules.Context(enemy_recent=sum(self._enemy_frames))
+            calls = asdict(rules.evaluate(reading, boxes, context))
+        except Exception as exc:
+            failed = exc
+        ms = (self._clock() - at) * 1000.0
+        with self._lock:
+            self._rules_ms.append(ms)
+            for field, value in (read or {}).items():
+                self._read_hits[field] = self._read_hits.get(field, 0) + (value not in (None, []))
+            for name, call in (calls or {}).items():
+                self._rule_calls[name] = self._rule_calls.get(name, 0) + (call is not None)
+            first = failed is not None and self._rules_errors == 0
+            self._rules_errors += failed is not None
+            farm = self._farm
+        if first:
+            log.warning("shadow reader or rules error, rows go on without them: %r", failed)
+        added: dict[str, Any] = {
+            "rules_ms": round(ms, 1),
+            "read": read,
+            "rules": calls,
+            "farm": None,
+            "farm_move": None,
+            "farm_move_age": None,
+        }
+        if farm is not None:
+            # the label the farm's last tick gave and its last move; its taps never reach here
+            state, phase, seen, move, moved_at = farm
+            added["farm"] = {"state": state, "phase": phase, "age": round(self._clock() - seen, 3)}
+            added["farm_move"] = move
+            if moved_at:
+                added["farm_move_age"] = round(self._clock() - moved_at, 3)
+        return added
 
     # -- the file ----------------------------------------------------------------
 

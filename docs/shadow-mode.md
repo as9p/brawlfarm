@@ -10,7 +10,7 @@ It needs a model: `models\play.onnx` and `models\play.json` under `%LOCALAPPDATA
 
 ## What it writes
 
-Shadow files land under `instances\<name>\shadow\`, one JSON lines file per match, with boxes and timings only. The newest 50 files are kept.
+Shadow files land under `instances\<name>\shadow\`, one JSON lines file per match. Each row holds boxes, timings, HUD readings, rule calls and the farm's last move kind. Rule calls are logged only and never sent to the game. The newest 50 files are kept.
 
 Three feed rows carry shadow mode: `play_on` when a session starts, `play_summary` once the match ends, and `play_fallback` when a session gives up, with a reason such as `model_missing`, `model_invalid`, `source_start`, `source_error`, `stale`, `detector_error` or `session_error`.
 
