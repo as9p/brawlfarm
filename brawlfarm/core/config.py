@@ -854,7 +854,9 @@ BUSH_QUIET_TRACK_PX = 120  # a cluster this close to the last target is the same
 BUSH_QUIET_MISS_TICKS = 3  # leave hidden after this many move ticks in a row with no bush
 BUSH_QUIET_GAS_TICKS = 3  # move ticks gas must read "closing" in a row before a relocate
 BUSH_QUIET_RELOCATE_COOLDOWN = 8.0  # seconds between relocations (cap BUSH_MAX_RELOCATIONS)
-BUSH_QUIET_JITTER_PX = 20  # keepalive swipe magnitude, out then back along one heading
+BUSH_QUIET_JITTER_PX = BUSH_JITTER_RADIUS  # keepalive drag on the joystick, out then back;
+# the same drag size the old in-bush jitter used live, so it is not lost in a joystick dead
+# zone. The short fixed duration, not the drag size, keeps the step on the map small.
 BUSH_QUIET_JITTER_MS = 150  # fixed keepalive swipe duration so the back swipe undoes the out
 BUSH_QUIET_HEALTH_DROP = 0.03  # self health fraction falling more than this => we were found
 BUSH_QUIET_FOUND_S = 6.0  # seconds of normal fire after a health drop while hidden
