@@ -843,6 +843,22 @@ BUSH_JITTER_RADIUS = 45  # small joystick swipe magnitude for the in-bush micro-
 BUSH_JITTER_MIN_INTERVAL = 4.0  # seconds between micro-jitters (well under idle-kick)
 BUSH_JITTER_MAX_INTERVAL = 8.0
 
+# Quiet bush (BRAWL_BUSH_QUIET=1, only with BUSH_HIDE on): steadier hiding. A tracked
+# "hidden" state with hysteresis, gas closing confirmed over several move ticks with a
+# cooldown between relocations, an out-and-back keepalive swipe, and no attack, super or
+# ability taps while hidden unless our health drops. OFF by default: with the flag
+# absent the bush code above runs exactly as before. Unmeasured; tuned by the A/B.
+BUSH_QUIET = os.environ.get("BRAWL_BUSH_QUIET", "0") == "1"
+BUSH_QUIET_LEAVE_PX = 150  # hidden until the tracked bush is this far from self
+BUSH_QUIET_TRACK_PX = 120  # a cluster this close to the last target is the same bush
+BUSH_QUIET_MISS_TICKS = 3  # leave hidden after this many move ticks in a row with no bush
+BUSH_QUIET_GAS_TICKS = 3  # move ticks gas must read "closing" in a row before a relocate
+BUSH_QUIET_RELOCATE_COOLDOWN = 8.0  # seconds between relocations (cap BUSH_MAX_RELOCATIONS)
+BUSH_QUIET_JITTER_PX = 20  # keepalive swipe magnitude, out then back along one heading
+BUSH_QUIET_JITTER_MS = 150  # fixed keepalive swipe duration so the back swipe undoes the out
+BUSH_QUIET_HEALTH_DROP = 0.03  # self health fraction falling more than this => we were found
+BUSH_QUIET_FOUND_S = 6.0  # seconds of normal fire after a health drop while hidden
+
 # Play mode's detector runs beside an untouched farm loop and logs its boxes; it sends
 # no input. OFF by default: with the flag absent the worker behaves exactly as before.
 PLAY_SHADOW = os.environ.get("BRAWL_PLAY_SHADOW", "0") == "1"

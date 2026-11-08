@@ -82,6 +82,19 @@ def test_put_round_trips_the_shadow_flag_no_component_renders(api) -> None:
     assert "shadow = true" in S.config_path(home).read_text(encoding="utf-8")
 
 
+def test_put_round_trips_the_bush_quiet_flag(api) -> None:
+    client, sup, home = api
+    doc = client.get("/api/settings").json()
+    assert doc["behavior"]["bush_quiet"] is False
+    doc["behavior"]["bush_quiet"] = True
+    r = client.put("/api/settings", json=doc)
+    assert r.status_code == 200
+    assert r.json()["behavior"]["bush_quiet"] is True
+    assert sup.settings.behavior.bush_quiet is True
+    assert client.get("/api/settings").json()["behavior"] == r.json()["behavior"]
+    assert "bush_quiet = true" in S.config_path(home).read_text(encoding="utf-8")
+
+
 def test_put_round_trips_the_emulator_recycle_fields(api) -> None:
     client, sup, home = api
     doc = client.get("/api/settings").json()

@@ -187,6 +187,7 @@ def test_worker_env_is_the_full_contract(tmp_path: Path) -> None:
         "BRAWL_WINRATE_OPPORTUNITY_COST": "1",
         "BRAWL_GAS_AWARE": "1",
         "BRAWL_BUSH_HIDE": "0",
+        "BRAWL_BUSH_QUIET": "0",
         "BRAWL_PLAY_SHADOW": "0",
         "BRAWL_CLOSE_GAME_ON_STOP": "1",
         "BRAWL_FAST_INPUT": "1",
@@ -219,6 +220,28 @@ def test_config_play_shadow_follows_the_env() -> None:
         env = dict(base)
         if value is not None:
             env["BRAWL_PLAY_SHADOW"] = value
+        result = subprocess.run(
+            [sys.executable, "-c", code], env=env, capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected, value
+
+
+def test_worker_env_carries_bush_quiet_when_it_is_on(tmp_path: Path) -> None:
+    s = _two_instances()
+    assert s.behavior.bush_quiet is False
+    s.behavior.bush_quiet = True
+    assert S.worker_env(s, s.instances[0], tmp_path)["BRAWL_BUSH_QUIET"] == "1"
+
+
+def test_config_bush_quiet_follows_the_env() -> None:
+    """Off unless the env says 1, read at import time in a fresh process."""
+    base = {k: v for k, v in os.environ.items() if not k.startswith(("BRAWL_", "DISCORD_"))}
+    code = "from brawlfarm.core import config; print('1' if config.BUSH_QUIET else '0')"
+    for value, expected in ((None, "0"), ("0", "0"), ("1", "1")):
+        env = dict(base)
+        if value is not None:
+            env["BRAWL_BUSH_QUIET"] = value
         result = subprocess.run(
             [sys.executable, "-c", code], env=env, capture_output=True, text=True
         )
