@@ -177,6 +177,7 @@ class Controller:
         self._bush_jitter_at = 0.0
         self._relocations = 0
         self._bush_logged: str | None = None
+        self._reset_quiet_bush()
         # Phase D (ability buttons): per-button monotonic ts of the last tap, so a
         # button that stays lit (e.g. a mis-read) is tapped at most once per cooldown.
         self._ability_last: dict[str, float] = {}
@@ -1109,6 +1110,7 @@ class Controller:
         self._bush_jitter_at = 0.0
         self._relocations = 0
         self._bush_logged = None
+        self._reset_quiet_bush()
         self._reset_spectate()
 
     def phase_queuing(self, screen, state) -> None:
@@ -1306,6 +1308,161 @@ class Controller:
             self._bush_logged = "bush_approach"
             self.log(f"bush: approaching bush at {action.target}")
 
+    # --- Quiet bush (config.BUSH_QUIET, only with BUSH_HIDE on) ---------------
+    # Replaces the move tick's bush branch and holds fire while hidden. With the
+    # switch off none of this runs and the helpers above behave exactly as before.
+
+    def _reset_quiet_bush(self) -> None:
+        """Quiet-bush bookkeeping, reset at every match entry. _quiet_target is the
+        tracked bush while hidden, None while not hidden."""
+        self._quiet_target: tuple[float, float] | None = None
+        self._quiet_since = 0.0
+        self._quiet_miss = 0
+        self._quiet_gas_streak = 0
+        self._quiet_relocate_at = -math.inf
+        self._quiet_jitter_at = 0.0
+        self._quiet_jitter_gap = config.BUSH_JITTER_MIN_INTERVAL
+        self._quiet_jitter_heading = 0.0
+        self._quiet_jitter_out = True
+        self._quiet_health: float | None = None
+        self._quiet_found_until = 0.0
+
+    def _quiet_hold_fire(self, now: float) -> bool:
+        """True while hidden outside a found window: no attack, super or ability taps."""
+        return self._quiet_target is not None and now >= self._quiet_found_until
+
+    def _quiet_enter(self, target, now: float) -> None:
+        self._quiet_target = target
+        self._quiet_since = now
+        self._quiet_miss = 0
+        self._quiet_jitter_at = now
+        self._quiet_jitter_gap = random.uniform(
+            config.BUSH_JITTER_MIN_INTERVAL, config.BUSH_JITTER_MAX_INTERVAL
+        )
+        self._quiet_jitter_heading = random.uniform(0, 2 * math.pi)
+        self._quiet_jitter_out = True
+        self._quiet_health = None
+        self.dl.event("bush_hide", target=list(target), quiet=True)
+        self.log(f"bush quiet: hidden in bush near {target}")
+
+    def _quiet_leave(self, reason: str, now: float) -> None:
+        if self._quiet_target is None:
+            return
+        held = round(now - self._quiet_since, 1)
+        self._quiet_target = None
+        self.dl.event("bush_leave", reason=reason, held_s=held, quiet=True)
+        self.log(f"bush quiet: left bush ({reason}) after {held}s")
+
+    def _quiet_read_health(self, screen) -> float | None:
+        """Our health bar fill, or None when unknown. One HUD read per hidden move tick."""
+        if screen is None:
+            return None
+        try:
+            from brawlfarm.play import reader  # numpy and cv2 only, never the play extra
+
+            return reader.read(screen).self_health_fraction
+        except Exception as e:  # never let the HUD read break the move loop
+            self.dl.event("bush_error", err=repr(e))
+            return None
+
+    def _quiet_hold(self, screen, now: float) -> None:
+        """One hidden move tick. A health drop since the last read opens the found window
+        (normal fire for BUSH_QUIET_FOUND_S). The keepalive swipe, when due, is a small
+        fixed swipe along one heading, out then back, so we end where we started."""
+        self._last_move_target = self._quiet_target
+        health = self._quiet_read_health(screen)
+        if health is not None:
+            last = self._quiet_health
+            if last is not None and last - health > config.BUSH_QUIET_HEALTH_DROP:
+                if now >= self._quiet_found_until:
+                    self.dl.event("bush_found", health_from=round(last, 3), health=round(health, 3))
+                    self.log(f"bush quiet: health {last:.2f} -> {health:.2f}, found -> fire")
+                self._quiet_found_until = now + config.BUSH_QUIET_FOUND_S
+            self._quiet_health = health
+        if now - self._quiet_jitter_at >= self._quiet_jitter_gap:
+            heading = self._quiet_jitter_heading + (0.0 if self._quiet_jitter_out else math.pi)
+            ox, oy = config.MOVE_ORIGIN
+            dx = round(config.BUSH_QUIET_JITTER_PX * math.cos(heading))
+            dy = round(config.BUSH_QUIET_JITTER_PX * math.sin(heading))
+            adb.swipe(ox, oy, ox + dx, oy + dy, config.BUSH_QUIET_JITTER_MS)
+            self._last_move_heading = heading
+            self._quiet_jitter_out = not self._quiet_jitter_out
+            self._quiet_jitter_at = now
+            self._quiet_jitter_gap = random.uniform(
+                config.BUSH_JITTER_MIN_INTERVAL, config.BUSH_JITTER_MAX_INTERVAL
+            )
+
+    def _quiet_bush_move(self, screen, gas_fr, now: float) -> str:
+        """The move tick with quiet bush on; returns the move kind. Gas closing counts
+        only after BUSH_QUIET_GAS_TICKS move ticks in a row, with a cooldown between
+        relocations and the BUSH_MAX_RELOCATIONS cap. Hidden is entered within
+        BUSH_AT_TARGET_PX and kept on the same bush until it is beyond
+        BUSH_QUIET_LEAVE_PX or missing for BUSH_QUIET_MISS_TICKS ticks in a row. Every
+        failure path still moves (wander), so idle-disconnect prevention holds."""
+        try:
+            clusters = match_vision.bush_clusters(screen)
+            action = match_vision.bush_decision(
+                clusters,
+                config.BUSH_SELF_POS,
+                (config.SCREEN_W, config.SCREEN_H),
+                set(self._gas_edges),
+                gas_fr,
+            )
+        except Exception as e:  # never let CV trouble break the move loop
+            self.dl.event("bush_error", err=repr(e))
+            clusters, action = [], None
+        closing = action is not None and action.kind == "relocate"
+        self._quiet_gas_streak = self._quiet_gas_streak + 1 if closing else 0
+        if (
+            self._quiet_gas_streak >= config.BUSH_QUIET_GAS_TICKS
+            and now - self._quiet_relocate_at >= config.BUSH_QUIET_RELOCATE_COOLDOWN
+        ):
+            self._quiet_leave("gas", now)
+            if self._relocations >= config.BUSH_MAX_RELOCATIONS:
+                self._wander_move(gas_fr)  # cap hit: the wander's gas repulsion flees
+                return "wander"
+            self._relocations += 1
+            self._quiet_relocate_at = now
+            self._last_move_target = action.target
+            self._heading = self._heading_to(action.target)
+            self._swipe_heading(self._heading)
+            self.dl.event(
+                "gas_relocate", target=list(action.target), n=self._relocations, quiet=True
+            )
+            self.log(f"bush quiet: gas closing -> relocate toward {action.target}")
+            return "relocate"
+        sx, sy = config.BUSH_SELF_POS
+        if self._quiet_target is not None:
+            tx, ty = self._quiet_target
+            same = min(clusters, key=lambda b: math.hypot(b.cx - tx, b.cy - ty), default=None)
+            if same is not None and math.hypot(same.cx - tx, same.cy - ty) <= (
+                config.BUSH_QUIET_TRACK_PX
+            ):
+                self._quiet_miss = 0
+                self._quiet_target = (same.cx, same.cy)
+                if math.hypot(same.cx - sx, same.cy - sy) > config.BUSH_QUIET_LEAVE_PX:
+                    self._quiet_leave("drift", now)
+            else:
+                self._quiet_miss += 1
+                if self._quiet_miss >= config.BUSH_QUIET_MISS_TICKS:
+                    self._quiet_leave("lost", now)
+            if self._quiet_target is not None:
+                self._quiet_hold(screen, now)
+                return "bush_quiet_hold"
+        nearest = min(clusters, key=lambda b: math.hypot(b.cx - sx, b.cy - sy), default=None)
+        if nearest is None:
+            self._wander_move(gas_fr)
+            return "wander"
+        target = (nearest.cx, nearest.cy)
+        if math.hypot(nearest.cx - sx, nearest.cy - sy) <= config.BUSH_AT_TARGET_PX:
+            self._quiet_enter(target, now)
+            self._quiet_hold(screen, now)
+            return "bush_quiet_hold"
+        self._last_move_target = target
+        self._heading = self._heading_to(target)
+        self._swipe_heading(self._heading)
+        return "hide"
+
     def phase_playing(self, screen, state) -> None:
         if state in (State.RESULTS, State.TROPHY_SCREEN):
             self._end_match()
@@ -1371,20 +1528,27 @@ class Controller:
         # prevention is preserved). It also never overrides the attack/survival reactions.
         if now - self.last_move >= self._move_gap:
             self._last_move_heading = self._last_move_target = None  # this tick sets its own
-            action = self._bush_action(screen, gas_fr)
-            if action is not None and action.kind != "wander":
-                self._steer_to_bush(action, now, gas_fr)
+            if config.BUSH_HIDE and config.BUSH_QUIET:
+                self._last_move_kind = self._quiet_bush_move(screen, gas_fr, now)
+                self.last_move = now
             else:
-                self._wander_move(gas_fr)
-                if self._bush_logged is not None:
-                    self._bush_logged = None  # left bush behavior -> allow a fresh log
-            self.last_move = now
-            if action is not None:
-                self._last_move_kind = action.kind
-            else:  # None is the switch being off or a detector failure: only the log tells them apart
-                self._last_move_kind = "wander" if config.BUSH_HIDE else "wander_off"
+                action = self._bush_action(screen, gas_fr)
+                if action is not None and action.kind != "wander":
+                    self._steer_to_bush(action, now, gas_fr)
+                else:
+                    self._wander_move(gas_fr)
+                    if self._bush_logged is not None:
+                        self._bush_logged = None  # left bush behavior -> allow a fresh log
+                self.last_move = now
+                if action is not None:
+                    self._last_move_kind = action.kind
+                else:  # None is the switch being off or a detector failure: only the log tells them apart
+                    self._last_move_kind = "wander" if config.BUSH_HIDE else "wander_off"
             self._move_gap = random.uniform(config.MOVE_INTERVAL_MIN, config.MOVE_INTERVAL_MAX)
-        if now - self.last_attack >= self._attack_gap:
+        # Quiet bush: while hidden, no attack, super or ability taps unless a health drop
+        # opened the found window. Off (or not hidden) fires exactly as before.
+        hold_fire = config.BUSH_HIDE and config.BUSH_QUIET and self._quiet_hold_fire(now)
+        if not hold_fire and now - self.last_attack >= self._attack_gap:
             self.tap(self._jitter(config.ATTACK_POINT))  # auto-aim attack (slight pos jitter)
             self.tap(self._jitter(config.SUPER_BUTTON))  # harmless no-op unless charged
             self.last_attack = now
@@ -1395,7 +1559,7 @@ class Controller:
         # green / super=yellow / hypercharge=purple). Worst case is a tap on a
         # mis-read button face, which the game ignores — but a per-button cooldown
         # still bounds it so a stuck-lit read can't turn into tap spam.
-        if config.ABILITY_BUTTONS_ENABLED and config.ABILITY_BUTTONS:
+        if not hold_fire and config.ABILITY_BUTTONS_ENABLED and config.ABILITY_BUTTONS:
             for name, frac in match_vision.ready_abilities(screen).items():
                 if now - self._ability_last.get(name, 0.0) < config.ABILITY_TAP_COOLDOWN:
                     continue
