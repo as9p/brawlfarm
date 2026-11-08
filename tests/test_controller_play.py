@@ -15,6 +15,8 @@ import subprocess
 import sys
 import time
 
+import cv2
+import numpy as np
 import pytest
 
 from brawlfarm.core import config
@@ -22,6 +24,7 @@ from brawlfarm.core import controller as controller_mod
 from brawlfarm.core.controller import Controller
 from brawlfarm.core.match_vision import BushAction
 from brawlfarm.core.states import State
+from brawlfarm.play import reader
 
 
 class _DL:
@@ -491,3 +494,141 @@ def test_shadow_on_imports_the_session_module() -> None:
     # The mirror, at the menu: the session is built and ticked for real, but a tick that
     # is not a match starts no stream, so this needs neither adb nor the play extra.
     assert _probe("1", "menu", "MENU") == "True"
+
+
+# --- The spectate exit: the whole team is out, so tap Exit and stop playing -----------------
+
+_SCREEN = object()  # a frame stand-in: these tests stub the one reader that looks at it
+
+
+class _Gas:
+    def reset(self):
+        pass
+
+
+def _spectator(monkeypatch, reads):
+    """A _mover whose in-match ticks read ``reads`` (one bool per tick) from the spectate
+    check, with every tick a move and attack tick, and taps and moves recorded, not sent."""
+    c = _mover(monkeypatch, None)
+    c.taps = []
+    c.moves = 0
+
+    def wander(gas_fr):
+        c.moves += 1
+
+    c._wander_move = wander
+    c.tap = lambda point, kind=None: c.taps.append((point, kind))
+    c.set_phase = lambda name: None
+    c._gas = _Gas()
+    c._reset_spectate()
+    values = iter(reads)
+    monkeypatch.setattr(reader, "spectating", lambda frame: next(values))
+    return c
+
+
+def _ticks(c, n):
+    for _ in range(n):
+        c.last_move = c.last_attack = 0.0
+        c._attack_gap = 0.0
+        c.phase_playing(_SCREEN, State.IN_MATCH)
+
+
+def _exits(c):
+    return [t for t in c.taps if t == (config.SPECTATE_EXIT_BUTTON, "leave_spectate")]
+
+
+def _left(c):
+    return [fields for kind, fields in c.dl.events if kind == "leave_spectate"]
+
+
+def test_two_spectating_ticks_tap_exit_once(monkeypatch) -> None:
+    c = _spectator(monkeypatch, [True, True])
+    _ticks(c, 2)
+    assert c.taps == [(config.SPECTATE_EXIT_BUTTON, "leave_spectate")]
+    assert _left(c) == [{"tap": 1}]
+    assert c.moves == 0  # no blind moves or attacks on the spectate screen
+
+
+def test_one_spectating_tick_taps_nothing(monkeypatch) -> None:
+    c = _spectator(monkeypatch, [True, False, True])
+    _ticks(c, 3)
+    assert _exits(c) == []
+    assert _left(c) == []
+
+
+def test_alive_ticks_play_as_before(monkeypatch) -> None:
+    c = _spectator(monkeypatch, [False, False])
+    _ticks(c, 2)
+    assert c.moves == 2
+    assert _exits(c) == []
+    assert len(c.taps) == 4  # attack and super, each tick
+
+
+def test_a_fresh_match_resets_the_debounce(monkeypatch) -> None:
+    c = _spectator(monkeypatch, [True, True])
+    _ticks(c, 1)
+    c._enter_match()
+    _ticks(c, 1)
+    assert _exits(c) == []
+
+
+def test_a_fresh_match_resets_the_taps(monkeypatch) -> None:
+    c = _spectator(monkeypatch, [True] * 30 + [True, True])
+    _ticks(c, 30)  # three taps, then given up for that match
+    c._enter_match()
+    _ticks(c, 2)
+    assert [f["tap"] for f in _left(c)] == [1, 2, 3, 1]
+
+
+def test_a_tap_that_takes_is_not_repeated(monkeypatch) -> None:
+    c = _spectator(monkeypatch, [True, True] + [False] * 5)
+    _ticks(c, 7)
+    assert len(_exits(c)) == 1
+
+
+def test_a_tap_that_does_not_take_retries_twice_then_gives_up(monkeypatch) -> None:
+    c = _spectator(monkeypatch, [True] * 30)
+    _ticks(c, 30)
+    assert len(_exits(c)) == config.SPECTATE_MAX_TAPS == 3
+    assert [f["tap"] for f in _left(c)] == [1, 2, 3]
+    assert c._spectate_off is True
+    assert c.moves > 0  # gave up: the old behaviour, playing the match out
+
+
+def test_a_failing_reader_logs_once_and_plays_on(monkeypatch) -> None:
+    c = _spectator(monkeypatch, [])
+
+    def boom(frame):
+        raise ValueError("bad frame")
+
+    monkeypatch.setattr(reader, "spectating", boom)
+    _ticks(c, 3)
+    assert [kind for kind, _ in c.dl.events].count("leave_spectate_error") == 1
+    assert c.moves == 3
+    assert _exits(c) == []
+
+
+def test_the_spectate_exit_ignores_the_play_switches(monkeypatch) -> None:
+    monkeypatch.setattr(config, "PLAY_SHADOW", False)
+    c = _spectator(monkeypatch, [True, True])
+    monkeypatch.setattr(config, "BUSH_HIDE", False)
+    _ticks(c, 2)
+    assert len(_exits(c)) == 1
+
+
+def test_the_spectate_exit_reads_a_real_frame() -> None:
+    """The real reader on a synthetic frame: the Exit label alone, two ticks, one tap."""
+    c = _ctrl()
+    c.taps = []
+    c.tap = lambda point, kind=None: c.taps.append((point, kind))
+    c._reset_spectate()
+    frame = np.zeros((reader.FRAME_H, reader.FRAME_W, 3), dtype=np.uint8)
+    x0, y0, x1, y1 = reader.EXIT_LABEL_BOX
+    label = reader.EXIT_LABEL.astype(np.uint8)
+    big = cv2.resize(label, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST)
+    frame[y0:y1, x0:x1][big > 0] = 255
+    assert c._leave_spectate(frame) is True
+    assert c.taps == []
+    assert c._leave_spectate(frame) is True
+    assert _exits(c) == [(config.SPECTATE_EXIT_BUTTON, "leave_spectate")]
+    assert c._leave_spectate(np.zeros_like(frame)) is True  # the tap is settling

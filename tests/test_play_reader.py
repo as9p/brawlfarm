@@ -418,3 +418,39 @@ def test_read_leaves_the_frame_alone() -> None:
     before = frame.copy()
     reader.read(frame)
     assert np.array_equal(frame, before)
+
+
+def test_the_exit_label_alone_is_spectating() -> None:
+    frame = blank()
+    put(frame, reader.EXIT_LABEL_BOX, reader.EXIT_LABEL)
+    assert reader.spectating(frame) is True
+
+
+def test_a_respawn_countdown_is_never_spectating() -> None:
+    """Back in means a teammate lives and we come back: never leave then."""
+    both = blank()
+    put(both, reader.BACK_LABEL_BOX, reader.BACK_LABEL)
+    put(both, reader.EXIT_LABEL_BOX, reader.EXIT_LABEL)
+    assert reader.spectating(both) is False
+    back = blank()
+    put(back, reader.BACK_LABEL_BOX, reader.BACK_LABEL)
+    assert reader.spectating(back) is False
+
+
+@pytest.mark.parametrize("floor", [FLOOR, WHITE, BLACK])
+def test_no_label_is_not_spectating(floor: tuple[int, ...]) -> None:
+    assert reader.spectating(blank(floor)) is False
+
+
+def test_an_alive_hud_is_not_spectating() -> None:
+    frame = blank()
+    teams(frame)
+    self_unit(frame)
+    assert reader.spectating(frame) is False
+
+
+def test_an_exit_label_off_its_spot_is_not_spectating() -> None:
+    x0, y0, x1, y1 = reader.EXIT_LABEL_BOX
+    frame = blank()
+    put(frame, (x0 + 200, y0 - 100, x1 + 200, y1 - 100), reader.EXIT_LABEL)
+    assert reader.spectating(frame) is False
