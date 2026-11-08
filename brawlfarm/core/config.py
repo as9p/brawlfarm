@@ -429,6 +429,15 @@ CEREMONY_MAX_SCREENS = 4  # max ceremony screens cleared per recovery cycle, the
 INGAME_MODAL_OK_BUTTON = (440, 520)  # OK button on the server-error modal
 INGAME_MODAL_CHECK_EVERY = 12  # scan for the modal every Nth in-match playing iteration
 
+# Spectate camera (Trio Showdown, the whole team is out): an "Exit" button sits where the
+# controls were. Not the results screen's EXIT_BUTTON. The point is the centre of the play
+# reader's EXIT_LABEL_BOX (777, 822, 822, 843). Read by brawlfarm.play.reader.spectating,
+# which is False while the respawn "Back in:" countdown is up (a teammate still lives).
+SPECTATE_EXIT_BUTTON = (799, 832)
+SPECTATE_CONFIRM_TICKS = 2  # consecutive spectating in-match ticks before the first tap
+SPECTATE_RETAP_TICKS = 3  # in-match ticks a tap gets to move off the spectate screen
+SPECTATE_MAX_TAPS = 3  # taps per match (the first plus two retries), then wait it out
+
 # Top-right HOME (white house) button. Returns to the main menu from sub-screens like the
 # brawler TROPHIES detail / Trophy Road (auto-shown at rank-up milestones). We exit those
 # via HOME — never a center-tap (re-opens the brawler) or BACK (project rule: taps only).

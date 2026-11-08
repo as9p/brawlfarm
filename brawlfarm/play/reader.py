@@ -473,6 +473,18 @@ def _dead(frame: np.ndarray) -> bool:
     return bool((leave == EXIT_LABEL).mean() >= EXIT_LABEL_MIN)
 
 
+def spectating(frame: np.ndarray) -> bool:
+    """The whole team is out: the spectate camera's "Exit" label is up and the respawn
+    "Back in:" label is not. "Back in" means a teammate lives and we come back, so it is
+    never a reason to leave. The same two small crops as _dead, so the farm can call this
+    on every in-match frame."""
+    back = _white_text(frame, BACK_LABEL_BOX, BACK_LABEL_SIZE)
+    if (back == BACK_LABEL).mean() >= BACK_LABEL_MIN:
+        return False
+    leave = _white_text(frame, EXIT_LABEL_BOX, EXIT_LABEL_SIZE)
+    return bool((leave == EXIT_LABEL).mean() >= EXIT_LABEL_MIN)
+
+
 def _cube_count(hsv: np.ndarray, anchor: _Anchor) -> int | None:
     """The cube digits, only beside a badge. The badge does hide at zero, but a covered badge
     looks the same, so no badge reads as None and not as zero."""

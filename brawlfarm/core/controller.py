@@ -145,7 +145,7 @@ class Controller:
             config.HOME_DIR / "calibration", config.DATA_DIR.name, config.DATA_DIR / "record.flag"
         )
         # Shadow play session (the model watching the farm play): built on the first tick
-        # that needs it, so a worker with `shadow` off never imports the play package.
+        # that needs it, so a worker with `shadow` off never imports the play session.
         # Observation only: it never taps. _play_off latches on the first failure.
         self.play = None
         self._play_off = False
@@ -180,6 +180,9 @@ class Controller:
         # Phase D (ability buttons): per-button monotonic ts of the last tap, so a
         # button that stays lit (e.g. a mis-read) is tapped at most once per cooldown.
         self._ability_last: dict[str, float] = {}
+        # Spectate exit (the whole team is out): debounce, taps and retry bookkeeping.
+        # Reset at every match entry.
+        self._reset_spectate()
         # Fast re-entry + status-heartbeat + mid-session brawler-switch bookkeeping.
         self._unknown_streak = 0  # consecutive UNKNOWN frames (detects the home screen fast)
         # UNKNOWN-path handler repeat guard (_unknown_modal): which handler branch the last
@@ -1106,6 +1109,7 @@ class Controller:
         self._bush_jitter_at = 0.0
         self._relocations = 0
         self._bush_logged = None
+        self._reset_spectate()
 
     def phase_queuing(self, screen, state) -> None:
         elapsed = time.monotonic() - self.phase_started
@@ -1144,6 +1148,65 @@ class Controller:
         self.log(f"match ended (game #{self.games_played})")
         self.maybe_log_battlelog()  # (the just-ended game lands a few min later)
         self.set_phase("returning")
+
+    # --- Spectate exit (Trio Showdown, the whole team is out) -----------------
+
+    def _reset_spectate(self) -> None:
+        self._spectate_streak = 0  # consecutive in-match ticks that read spectating
+        self._spectate_taps = 0  # Exit taps sent this match
+        self._spectate_wait: int | None = None  # in-match ticks since the last tap, None if none
+        self._spectate_off = False  # gave up or the reader failed: the old behaviour this match
+
+    def _leave_spectate(self, screen) -> bool:
+        """One in-match tick of the spectate exit. Once the whole team is out the game shows
+        a spectate camera with an Exit button; tapping it ends our match now instead of when
+        the match ends for everyone, and the normal loop then finds the results screen.
+
+        Two spectating ticks in a row before the first tap (debounce; any tick that reads
+        False resets it). A tap that has not moved the screen off spectate within
+        SPECTATE_RETAP_TICKS gets a retry, up to SPECTATE_MAX_TAPS taps a match; then this
+        gives up for the match and the farm waits it out as before. Returns True when the
+        tick must send no move or attack: the spectate screen is up or a tap is settling.
+        Not gated on the play or shadow switches. Any failure turns it off for the match
+        after one event, because the farm must never crash on it."""
+        if screen is None or getattr(self, "_spectate_off", False):
+            return False
+        try:
+            from brawlfarm.play import reader  # numpy and cv2 only, never the play extra
+
+            seen = reader.spectating(screen)
+            wait = getattr(self, "_spectate_wait", None)
+            if wait is not None:
+                wait += 1
+                self._spectate_wait = wait
+            if not seen:
+                self._spectate_streak = 0
+                if wait is None:
+                    return False
+                if wait >= config.SPECTATE_RETAP_TICKS:
+                    self._spectate_wait = None  # the tap took: off the spectate screen
+                    return False
+                return True  # a tap is still settling
+            self._spectate_streak = getattr(self, "_spectate_streak", 0) + 1
+            if wait is None and self._spectate_streak < config.SPECTATE_CONFIRM_TICKS:
+                return True
+            if wait is not None and wait < config.SPECTATE_RETAP_TICKS:
+                return True
+            taps = getattr(self, "_spectate_taps", 0)
+            if taps >= config.SPECTATE_MAX_TAPS:
+                self._spectate_off = True
+                self.log(f"spectate Exit did not take after {taps} taps -> wait the match out")
+                return False
+            self._spectate_taps = taps + 1
+            self._spectate_wait = 0
+            self.tap(config.SPECTATE_EXIT_BUTTON, kind="leave_spectate")
+            self.dl.event("leave_spectate", tap=taps + 1)
+            self.log(f"team out (spectating) -> tap Exit ({taps + 1}/{config.SPECTATE_MAX_TAPS})")
+            return True
+        except Exception as e:  # never let the spectate exit break the playing loop
+            self._spectate_off = True
+            self.dl.event("leave_spectate_error", err=repr(e))
+            return False
 
     # --- Phase B (bush-hide + gas relocation) movement helpers ----------------
     # All fully guarded: any failure returns the WANDER fallback so the existing
@@ -1272,6 +1335,9 @@ class Controller:
                 time.sleep(config.TAP_SETTLE)
                 self.set_phase("returning")
                 return
+        # The whole team is out (spectate camera): tap its Exit and send nothing else.
+        if self._leave_spectate(screen):
+            return
         now = time.monotonic()
         # Phase A: read the gas edge-bands every in-match frame (4 cheap ROI checks)
         # and fold them through the hysteresis tracker. The fractions feed the heading
