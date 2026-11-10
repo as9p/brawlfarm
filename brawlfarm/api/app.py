@@ -1,7 +1,7 @@
 """The FastAPI application factory.
 
 One app per process. create_app(sup, home) stores the live supervisor and the data
-directory on app.state, refuses non-loopback clients, runs one supervisor tick during
+directory on app.state, refuses non-loopback clients and foreign Host headers, runs one supervisor tick during
 startup so the first request already has instance views to show, and serves the built web
 UI from brawlfarm/web/dist when phase 4 has produced one.
 
@@ -22,6 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 import brawlfarm
 from brawlfarm import __version__, play
@@ -51,6 +52,11 @@ from brawlfarm.supervisor import Supervisor
 log = logging.getLogger("brawlfarm.api")
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+# The names a Host header may carry. TrustedHostMiddleware compares the part before the
+# port, so 127.0.0.1:8765, a --port run and the Vite dev server on localhost:5173 all
+# pass. A page that rebinds its own DNS name to 127.0.0.1 still sends that name, so the
+# loopback peer check alone cannot stop it and this list does.
+ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 
 PLACEHOLDER_HTML = """<!doctype html>
 <html lang="en">
@@ -165,6 +171,10 @@ def create_app(sup: Supervisor, home: Path) -> FastAPI:
         if client is not None and client.host not in LOOPBACK_HOSTS:
             return JSONResponse({"detail": "loopback only"}, status_code=403)
         return await call_next(request)
+
+    # Added after the loopback guard, so it runs first: a request with any other Host
+    # header gets the middleware's 400 "Invalid host header" before a route sees it.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(ALLOWED_HOSTS))
 
     @app.get("/api/health")
     async def health(request: Request) -> dict:

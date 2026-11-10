@@ -1,4 +1,4 @@
-"""The app factory: loopback-only access, the health probe, the startup tick that fills
+"""The app factory: loopback-only access, the Host header guard, the health probe, the startup tick that fills
 the instance views before the first request, and the index (placeholder now, the built
 single-page app once brawlfarm/web/dist exists)."""
 
@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from brawlfarm.api import app as app_module
-from tests.apihelpers import make_client
+from tests.apihelpers import LOOPBACK, PANEL_URL, make_client
 
 
 @pytest.fixture()
@@ -50,10 +50,34 @@ def test_the_lifespan_runs_one_tick_so_views_exist(api) -> None:
 
 def test_a_non_loopback_client_is_refused(api) -> None:
     client, _sup, _home = api
-    stranger = TestClient(client.app, client=("10.0.0.5", 1))
+    stranger = TestClient(client.app, base_url=PANEL_URL, client=("10.0.0.5", 1))
     r = stranger.get("/api/health")
     assert r.status_code == 403
     assert r.json() == {"detail": "loopback only"}
+
+
+@pytest.mark.parametrize("host", ["evil.example", "evil.example:8765", "192.168.1.20:8765"])
+def test_a_foreign_host_header_is_refused(api, host) -> None:
+    """DNS rebinding: the peer is 127.0.0.1 but the Host header names the attacker's site."""
+    client, _sup, _home = api
+    r = client.get("/api/settings", headers={"host": host})
+    assert r.status_code == 400
+    assert r.text == "Invalid host header"
+
+
+@pytest.mark.parametrize(
+    "host", ["127.0.0.1:8765", "127.0.0.1:9000", "localhost:5173", "localhost"]
+)
+def test_the_hosts_the_panel_really_uses_pass(api, host) -> None:
+    client, _sup, _home = api
+    r = client.get("/api/health", headers={"host": host})
+    assert r.status_code == 200
+
+
+def test_the_default_test_client_host_is_the_panel_address(api) -> None:
+    client, _sup, _home = api
+    plain = TestClient(client.app, client=LOOPBACK)  # Host: testserver
+    assert plain.get("/api/health").status_code == 400
 
 
 def test_the_index_is_a_placeholder_until_the_ui_is_built(tmp_path: Path, monkeypatch) -> None:
