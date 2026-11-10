@@ -29,3 +29,7 @@ brawlfarm/web/dist/
 /CLAUDE.md
 docs/superpowers/
 docs/PLAN.md
+
+# Claude Code session logs and local Claude state, never committed
+session-*.jsonl
+.claude/

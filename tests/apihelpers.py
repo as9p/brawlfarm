@@ -22,6 +22,7 @@ from brawlfarm.supervisor import Supervisor
 T0 = datetime(2026, 9, 10, 12, 0, 0)
 DEFAULT_PORTS = (5555, 5565, 5575)
 LOOPBACK = ("127.0.0.1", 50000)  # what TestClient reports as request.client
+PANEL_URL = "http://127.0.0.1:8765"  # the Host header the panel really gets
 
 
 @dataclass
@@ -143,6 +144,6 @@ def make_client(
         events_refresh=world.refresh,
     )
     scheduler.set_enabled(list(names), False)
-    client = TestClient(create_app(sup, home), client=LOOPBACK)
+    client = TestClient(create_app(sup, home), base_url=PANEL_URL, client=LOOPBACK)
     client.__enter__()  # runs the lifespan, so the startup tick has filled sup.views()
     return client, sup, home

@@ -244,3 +244,59 @@ def test_open_data_folder_reports_a_refusal_without_naming_the_path(api, monkeyp
     assert r.json() == {"detail": "could not open the data folder"}
     # The home directory is a Windows user path; it never goes into an error message.
     assert str(home) not in r.text
+
+
+TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOi-fake-token-1234"
+HOOK = "https://hook.invalid/api/webhooks/secret-part-9876"
+
+
+def _with_secrets(sup) -> None:
+    sup.settings.connection.brawl_api_token = TOKEN
+    sup.settings.notifications.webhook_url = HOOK
+
+
+def test_get_never_returns_the_full_token_or_webhook(api) -> None:
+    client, sup, _home = api
+    _with_secrets(sup)
+    r = client.get("/api/settings")
+    assert r.status_code == 200
+    assert TOKEN not in r.text
+    assert HOOK not in r.text
+    body = r.json()
+    assert body["connection"]["brawl_api_token"] == "********1234"
+    assert body["notifications"]["webhook_url"] == "********9876"
+
+
+def test_a_blank_secret_stays_blank_and_a_short_one_is_all_mask(api) -> None:
+    client, sup, _home = api
+    sup.settings.connection.brawl_api_token = "short"
+    body = client.get("/api/settings").json()
+    assert body["connection"]["brawl_api_token"] == "********"
+    assert body["notifications"]["webhook_url"] == ""
+
+
+def test_put_with_the_masked_values_keeps_the_stored_secrets(api) -> None:
+    client, sup, home = api
+    _with_secrets(sup)
+    doc = client.get("/api/settings").json()
+    doc["app"]["port"] = 9001
+    r = client.put("/api/settings", json=doc)
+    assert r.status_code == 200
+    assert TOKEN not in r.text
+    assert HOOK not in r.text
+    assert sup.settings.connection.brawl_api_token == TOKEN
+    assert sup.settings.notifications.webhook_url == HOOK
+    saved = S.load(home)
+    assert saved.connection.brawl_api_token == TOKEN
+    assert saved.app.port == 9001
+
+
+def test_put_with_a_new_value_replaces_the_secret(api) -> None:
+    client, sup, _home = api
+    _with_secrets(sup)
+    doc = client.get("/api/settings").json()
+    doc["connection"]["brawl_api_token"] = "a-brand-new-token-value"
+    doc["notifications"]["webhook_url"] = ""
+    assert client.put("/api/settings", json=doc).status_code == 200
+    assert sup.settings.connection.brawl_api_token == "a-brand-new-token-value"
+    assert sup.settings.notifications.webhook_url == ""
