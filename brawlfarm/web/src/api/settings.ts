@@ -3,9 +3,10 @@
  *
  * GET and PUT are both whole-document: the API has no PATCH, so every write goes through
  * settings/useSettingsPatch.ts, which reads, mutates a clone and puts the whole thing back.
- * The response carries connection.brawl_api_token in full because the API is loopback-only
- * and masking is the panel's job: the token reaches exactly one masked Field, is never
- * logged, never stored anywhere but the query cache, and never rendered unmasked by default.
+ * The server masks connection.brawl_api_token and notifications.webhook_url in every
+ * answer (eight asterisks plus the last four characters). Putting that masked value back
+ * unchanged keeps the stored secret, so a whole-document PUT from any screen is safe; a
+ * value that differs from the mask is saved as typed.
  */
 import { api } from "./client";
 import type { AppSettings, NotifyTestResponse } from "./types";

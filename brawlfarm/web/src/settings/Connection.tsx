@@ -9,7 +9,8 @@
  *
  * Both fields save 500 ms after the last keystroke and at once on blur. Neither has a Save
  * button, and neither ever logs what was typed: the token reaches the masked Field, the PUT
- * body and nothing else.
+ * body and nothing else. The server only ever sends the token back masked, so the Field
+ * shows that mask until a new token is typed over it.
  *
  * Check connection asks GET /api/connection/check, which reads the token and the player tags
  * from disk and never takes a typed value, so it waits until the form has nothing unsaved in
