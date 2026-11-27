@@ -2,7 +2,7 @@
 
 ![The Fleet page: one card per instance with today's games and trophies](docs/img/fleet.png)
 
-An open-source Brawl Stars trophy farmer for BlueStacks on Windows, with a local control panel in your browser.
+An open-source computer vision tool that plays Brawl Stars on BlueStacks for Windows, with a local control panel in your browser.
 
 **Install:** `uv tool install brawlfarm` (Windows 11, BlueStacks 5 with adb on, Python 3.13 and [uv](https://docs.astral.sh/uv/))
 
@@ -11,7 +11,7 @@ An open-source Brawl Stars trophy farmer for BlueStacks on Windows, with a local
 - **Farms Trio Showdown:** queue, play, results, back to the menu, repeat.
 - **Survives interruptions:** rewards, popups, rank-ups, disconnects, crashes, freezes, team invites.
 - **Two farm modes:** ladder (the whole roster in 100-trophy tiers) or prestige (one brawler to 1000 at a time), plus an optional maxed fallback.
-- **Anti-ban scheduler:** human-shaped sessions with breaks, on by default.
+- **Session scheduler:** play in sessions with breaks through the day instead of around the clock, on by default.
 - **Many instances:** several BlueStacks instances at once, one worker per instance.
 - **Local panel:** live screens, activity feed, farm plan, schedule, stats, settings and calibration.
 - **Alerts:** webhook, ntfy and a healthchecks.io ping on every supervisor tick.

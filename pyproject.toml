@@ -1,7 +1,7 @@
 [project]
 name = "brawlfarm"
 version = "1.1.0"
-description = "Open-source Brawl Stars trophy farmer for BlueStacks, with a local control panel"
+description = "Computer vision automation for Brawl Stars on BlueStacks, with a local control panel"
 readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"
