@@ -137,7 +137,7 @@ Leave the "Start <instance> now" switch on at the end of the wizard and press Op
 
 The card goes to Starting while the worker comes up and checks the display, then to Farming once it is queuing. Underneath the state it names the phase it is in: at menu, queuing, playing or returning. The activity feed on the instance page says the same thing in plain sentences, one line per match and per interruption.
 
-The anti-ban scheduler is on by default. It draws a human-shaped set of sessions for the day, with breaks between them, and the worker sits in Scheduled break between them instead of farming around the clock. You can see today's sessions on the instance page and turn the scheduler off, or override it for the day, in Settings.
+The session scheduler is on by default. It draws a set of sessions for the day, with breaks between them, and the worker sits in Scheduled break between them instead of farming around the clock. You can see today's sessions on the instance page and turn the scheduler off, or override it for the day, in Settings.
 
 Stop on the card finishes the current match first: the card reads "Stopping after this match" until that match ends, then Stopped. Stop all at the top of the page does the same for every instance, and Restart on a card stops the worker and brings it back on the next tick.
 
