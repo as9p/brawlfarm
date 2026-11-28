@@ -84,11 +84,23 @@ def set_instances(mapping: dict[str, dict[str, str]]) -> None:
 
 # --- ADB connection ----------------------------------------------------------
 
+# Which emulator this worker drives: "bluestacks" (BlueStacks 5) or "mumu" (MuMu Player 12).
+# It picks the touch path (fixed BlueStacks constants, or the node read from the device)
+# and the default adb port. Set per instance in config.toml; see settings.py.
+EMULATORS = ("bluestacks", "mumu")
+EMULATOR = os.environ.get("BRAWL_EMULATOR", "bluestacks").strip().lower()
+if EMULATOR not in EMULATORS:
+    EMULATOR = "bluestacks"
+
 # Ports come from bluestacks.conf, one per instance, usually 5555, 5565, 5575, ...
+# MuMu instance 0 answers on 16384 (instance n on 16384 + 32 n), and ALSO listens on
+# 5555 while it runs, which pushes a BlueStacks instance that wanted 5555 to 5556. The
+# worker checks at startup that the device behind its port is the emulator it expects.
 # Port is env-overridable so a second process/instance can target another emulator
 # (e.g. BRAWL_ADB_PORT=5565 for the second one) — needed for multi-instance work.
+DEFAULT_ADB_PORTS = {"bluestacks": 5555, "mumu": 16384}
 ADB_HOST = os.environ.get("BRAWL_ADB_HOST", "127.0.0.1")
-ADB_PORT = int(os.environ.get("BRAWL_ADB_PORT", "5555"))
+ADB_PORT = int(os.environ.get("BRAWL_ADB_PORT", str(DEFAULT_ADB_PORTS[EMULATOR])))
 ADB_SERIAL = f"{ADB_HOST}:{ADB_PORT}"
 
 
@@ -118,10 +130,15 @@ GAME_LAUNCH_TIMEOUT = 45  # seconds to wait for the game to foreground
 # "Virtual Touch" — a type-A multitouch, position-only node (ABS_MT_POSITION_X/Y only),
 # coordinate range 0..TOUCH_MAX. If a different emulator/device misbehaves (taps do
 # nothing), set BRAWL_FAST_INPUT=0 to force the old path.
+# The three TOUCH_* constants are BlueStacks only. On MuMu core/touch.py reads the node,
+# its ranges, its protocol (type B there) and the display rotation from the device.
 FAST_INPUT = os.environ.get("BRAWL_FAST_INPUT", "1") != "0"
 TOUCH_DEVICE = "/dev/input/event4"  # the "BlueStacks Virtual Touch" node
 TOUCH_MAX_X = 32767  # ABS_MT_POSITION_X max (taps scale pixel_x/SCREEN_W*this)
 TOUCH_MAX_Y = 32767  # ABS_MT_POSITION_Y max
+TOUCH_ROTATION_TTL_S = 60.0  # re-read the display rotation this often (MuMu)
+TOUCH_PROFILE_RETRY_S = 30.0  # after a failed touch-node read, wait this long (MuMu)
+TOUCH_HOLD_S = 0.05  # type B tap: finger down this long before up, in the same shell call
 
 
 # --- Fast capture --------------------------------------------------------------

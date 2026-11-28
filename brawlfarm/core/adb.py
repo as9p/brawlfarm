@@ -14,6 +14,7 @@ have multiple BlueStacks instances open.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import struct
 import subprocess
@@ -23,7 +24,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from brawlfarm.core import config
+from brawlfarm.core import config, touch
 
 
 class AdbError(RuntimeError):
@@ -124,12 +125,18 @@ def connect(serial: str | None = None) -> None:
         if line.startswith(serial):
             state = line.split("\t")[-1].strip() if "\t" in line else ""
             if state == "device":
+                if serial == config.ADB_SERIAL:
+                    reset_touch_profile()  # a restarted emulator may number its nodes anew
                 return
             raise AdbError(f"Device {serial} is in state '{state}', not 'device'.")
-    raise AdbError(
-        f"Could not connect to {serial}. Is BlueStacks running, and is "
-        f"ADB enabled (Settings -> Advanced -> Android Debug Bridge)?"
-    )
+    if config.EMULATOR == "mumu":
+        hint = "Is MuMu Player running? Its instance 0 answers on port 16384."
+    else:
+        hint = (
+            "Is BlueStacks running, and is ADB enabled "
+            "(Settings -> Advanced -> Android Debug Bridge)?"
+        )
+    raise AdbError(f"Could not connect to {serial}. {hint}")
 
 
 # RAW capture self-disable: if the device streams a raw format we can't parse (header
@@ -196,49 +203,110 @@ def screencap(serial: str | None = None) -> np.ndarray:
 # --- Fast input (raw /dev/input writes) --------------------------------------
 # `adb shell input tap/swipe` spawns a JVM per call (~700ms + CPU churn -> timeouts under
 # load). Instead we write the raw touch events straight to the device node in one shell
-# call (~70ms, no JVM). The node is a type-A multitouch, position-only device, so a touch
-# frame is: ABS_MT_POSITION_X, ABS_MT_POSITION_Y, SYN_MT_REPORT, SYN_REPORT; lifting the
-# finger is an empty MT frame: SYN_MT_REPORT, SYN_REPORT. See config.FAST_INPUT.
-_EV_ABS, _EV_SYN = 3, 0
-_ABS_MT_X, _ABS_MT_Y = 53, 54
-_SYN_REPORT, _SYN_MT_REPORT = 0, 2
+# call (~70ms, no JVM). BlueStacks' node is type A in the screen's own frame; MuMu's is
+# type B in the display's natural portrait frame. core/touch.py builds the frames for
+# both; the profile below says which. See config.FAST_INPUT.
+
+# The touch profile for config.ADB_SERIAL, built on first use. False means the device has
+# no usable touch node, so this session stays on `adb shell input`.
+_touch_profile: touch.TouchProfile | None | bool = None
+_rotation_read_at = 0.0
+# When the last `getevent -p` failed, so a device that keeps failing costs one extra adb
+# call per config.TOUCH_PROFILE_RETRY_S, not one per tap.
+_profile_failed_at: float | None = None
 
 
-def _ev(t: int, c: int, v: int) -> bytes:
-    # 64-bit struct input_event: time(8+8), type(H), code(H), value(i) = 24 bytes, LE.
-    return struct.pack("<qqHHi", 0, 0, t, c, v)
+def reset_touch_profile() -> None:
+    """Forget the touch profile so the next input reads the device again."""
+    global _touch_profile, _rotation_read_at, _profile_failed_at
+    _touch_profile, _rotation_read_at, _profile_failed_at = None, 0.0, None
 
 
-def _touch_frame(x: int, y: int) -> bytes:
-    dx = round(int(x) / config.SCREEN_W * config.TOUCH_MAX_X)
-    dy = round(int(y) / config.SCREEN_H * config.TOUCH_MAX_Y)
-    return (
-        _ev(_EV_ABS, _ABS_MT_X, dx)
-        + _ev(_EV_ABS, _ABS_MT_Y, dy)
-        + _ev(_EV_SYN, _SYN_MT_REPORT, 0)
-        + _ev(_EV_SYN, _SYN_REPORT, 0)
-    )
+def input_nodes() -> list[touch.InputNode]:
+    """The device's input nodes from `getevent -p`. No JVM; about as cheap as a tap."""
+    return touch.parse_getevent(_run(["-s", config.ADB_SERIAL, "shell", "getevent", "-p"]))
 
 
-_TOUCH_UP = _ev(_EV_SYN, _SYN_MT_REPORT, 0) + _ev(_EV_SYN, _SYN_REPORT, 0)
+def display_rotation() -> int | None:
+    """The display rotation (0 to 3) as the input system sees it, or None when unread."""
+    try:
+        out = _run(["-s", config.ADB_SERIAL, "shell", "dumpsys", "input"], timeout=10.0)
+    except AdbError:
+        return None
+    return touch.parse_rotation(out)
 
 
-def _write_touch(blob: bytes) -> None:
+def _profile() -> touch.TouchProfile | None:
+    """The touch profile to write with, or None to use `adb shell input` instead."""
+    global _touch_profile, _rotation_read_at, _profile_failed_at
+    if config.EMULATOR == "bluestacks":
+        return touch.bluestacks_profile(
+            config.TOUCH_DEVICE,
+            config.TOUCH_MAX_X,
+            config.TOUCH_MAX_Y,
+            config.SCREEN_W,
+            config.SCREEN_H,
+        )
+    now = time.monotonic()
+    if _touch_profile is None:
+        if _profile_failed_at is not None and now - _profile_failed_at < (
+            config.TOUCH_PROFILE_RETRY_S
+        ):
+            return None
+        try:
+            node = touch.pick_touch_node(input_nodes())
+        except AdbError:
+            _profile_failed_at = now  # read again once the retry wait is over
+            return None
+        _profile_failed_at = None
+        if node is None:
+            _touch_profile = False
+            return None
+        _touch_profile = touch.TouchProfile.from_node(
+            node, config.SCREEN_W, config.SCREEN_H, display_rotation()
+        )
+        _rotation_read_at = now
+    elif _touch_profile is not False and now - _rotation_read_at >= config.TOUCH_ROTATION_TTL_S:
+        rotation = display_rotation()
+        if rotation is not None:
+            _touch_profile.rotation = rotation
+        _rotation_read_at = now
+    return _touch_profile or None
+
+
+def _write_touch(blob: bytes, device: str | None = None, *then: bytes) -> None:
     """Write raw input_event bytes to the touch node in one shell call (octal-escaped
-    through printf, so only ASCII crosses adb — no binary-over-shell issues)."""
-    esc = "".join("\\%03o" % b for b in blob)
-    _run(["-s", config.ADB_SERIAL, "shell", f"printf '{esc}' > {config.TOUCH_DEVICE}"])
+    through printf, so only ASCII crosses adb — no binary-over-shell issues). Each blob
+    in ``then`` is written after a config.TOUCH_HOLD_S pause in the same call."""
+    device = device or config.TOUCH_DEVICE
+
+    def put(b: bytes) -> str:
+        esc = "".join("\\%03o" % c for c in b)
+        return f"printf '{esc}' > {device}"
+
+    script = "; ".join([put(blob), *(f"sleep {config.TOUCH_HOLD_S:g}; {put(b)}" for b in then)])
+    _run(["-s", config.ADB_SERIAL, "shell", script])
 
 
 def tap(x: int, y: int) -> None:
     """Tap a single screen coordinate (pixels). Uses the fast raw-write path when
     config.FAST_INPUT is on, falling back to `adb shell input tap` on any failure."""
     if config.FAST_INPUT:
-        try:
-            _write_touch(_touch_frame(x, y) + _TOUCH_UP)
-            return
-        except AdbError:
-            pass  # fall back to the slow-but-sure path
+        prof = _profile()
+        if prof is not None:
+            try:
+                if prof.protocol == "a":
+                    _write_touch(prof.down(x, y) + prof.up(), prof.device)
+                else:
+                    _write_touch(prof.down(x, y), prof.device, prof.up())
+                return
+            except AdbError:
+                if prof.protocol == "b":
+                    # The call may have died between down and up: lift the slot so no
+                    # finger stays held through the fallback tap.
+                    with contextlib.suppress(AdbError):
+                        _write_touch(prof.up(), prof.device)
+                # fall back to the slow-but-sure path
     _run(["-s", config.ADB_SERIAL, "shell", "input", "tap", str(int(x)), str(int(y))])
 
 
@@ -263,19 +331,21 @@ def swipe(x1: int, y1: int, x2: int, y2: int, duration_ms: int = 200) -> None:
     """Swipe / drag from (x1,y1) to (x2,y2) over duration_ms ms (also nudges the in-match
     joystick and scrolls menus). Fast path streams touch frames over the duration so the
     game sees a real moving finger; falls back to `adb shell input swipe` on failure."""
-    if config.FAST_INPUT:
+    prof = _profile() if config.FAST_INPUT else None
+    if prof is not None:
         try:
             frames = max(2, min(12, int(duration_ms) // 30))
-            _write_touch(_touch_frame(x1, y1))  # finger down
+            _write_touch(prof.down(x1, y1), prof.device)  # finger down
             for i in range(1, frames + 1):
                 t = i / frames
-                _write_touch(_touch_frame(round(x1 + (x2 - x1) * t), round(y1 + (y2 - y1) * t)))
+                step = prof.move(round(x1 + (x2 - x1) * t), round(y1 + (y2 - y1) * t))
+                _write_touch(step, prof.device)
                 time.sleep(duration_ms / 1000 / frames)
-            _write_touch(_TOUCH_UP)  # finger up
+            _write_touch(prof.up(), prof.device)  # finger up
             return
         except AdbError:
             try:
-                _write_touch(_TOUCH_UP)  # don't leave the finger stuck down
+                _write_touch(prof.up(), prof.device)  # don't leave the finger stuck down
             except AdbError:
                 pass
     _slow_swipe(x1, y1, x2, y2, duration_ms)
@@ -401,11 +471,48 @@ def package_version(package: str) -> str | None:
 
 
 def screen_size() -> tuple[int, int]:
-    """Return (width, height) of the BlueStacks display in pixels."""
+    """Return (width, height) of the display, as the frames the farm captures have it.
+
+    `wm size` gives the display's natural size. BlueStacks is landscape by nature, so
+    that is the answer. MuMu is portrait by nature (900x1600) and runs the game turned to
+    landscape, so a portrait answer is settled by the size of a real frame instead."""
     out = _run(["-s", config.ADB_SERIAL, "shell", "wm", "size"])
     # Output looks like: "Physical size: 1600x900"
     for token in out.replace("\n", " ").split():
         if "x" in token and token.replace("x", "").isdigit():
-            w, h = token.split("x")
-            return int(w), int(h)
+            w, h = (int(v) for v in token.split("x"))
+            if h > w and config.EMULATOR == "mumu":
+                # Only MuMu: a BlueStacks instance set to portrait must still fail the
+                # startup check rather than be excused by its frame.
+                frame = screencap()
+                return int(frame.shape[1]), int(frame.shape[0])
+            return w, h
     raise AdbError(f"Could not parse screen size from: {out!r}")
+
+
+def emulator_mismatch() -> str | None:
+    """A sentence when the device behind config.ADB_SERIAL is not config.EMULATOR, else None.
+
+    MuMu also listens on 5555 while it runs, so a worker set up for a BlueStacks instance
+    on 5555 can reach MuMu instead (BlueStacks then sits on 5556). The input node names
+    tell them apart: BlueStacks names its nodes for BlueStacks, MuMu for Xiaomi. A device
+    that cannot be read is not called a mismatch; the display check still runs after."""
+    try:
+        nodes = input_nodes()
+    except AdbError:
+        return None
+    if not nodes:
+        return None
+    seen = touch.emulator_of(nodes)
+    if config.EMULATOR == "bluestacks" and seen != "bluestacks":
+        return (
+            f"{config.ADB_SERIAL} is not a BlueStacks instance. MuMu Player also listens "
+            f"on 5555 while it runs and moves BlueStacks to the next port; close MuMu, or "
+            f"set this instance's emulator to mumu if it is MuMu."
+        )
+    if config.EMULATOR == "mumu" and seen == "bluestacks":
+        return (
+            f"{config.ADB_SERIAL} is a BlueStacks instance, but this instance is set to "
+            f"mumu. MuMu instance 0 answers on port 16384."
+        )
+    return None

@@ -21,7 +21,8 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 DISPLAY_HINT = (
     "Set the display to 1600 x 900 and pixel density 240 in BlueStacks: Settings, Display, "
-    "then restart the instance."
+    "then restart the instance. In MuMu Player, set the same size and DPI in its display "
+    "settings."
 )
 
 # `wm size` / `wm density` answer with a Physical line and, when the user set a custom
@@ -180,6 +181,19 @@ def display_check(adb_path: str, port: int, *, runner: Runner | None = None) -> 
     width, height = size
     if width == config.SCREEN_W and height == config.SCREEN_H and dpi == config.SCREEN_DPI:
         return DisplayCheck(True, width, height, dpi, f"{width} x {height} at DPI {dpi}", "")
+    if (width, height) == (config.SCREEN_H, config.SCREEN_W) and dpi == config.SCREEN_DPI:
+        # MuMu: portrait by nature, the game turned to landscape. The frame decides.
+        try:
+            frame = png_size(screencap_png(adb_path, port, runner=runner))
+        except AdbUnavailable as exc:
+            return DisplayCheck(
+                False, width, height, dpi, f"{width} x {height}, and {exc}", DISPLAY_HINT
+            )
+        if frame == (config.SCREEN_W, config.SCREEN_H):
+            fw, fh = frame
+            detail = f"{fw} x {fh} at DPI {dpi} (a {width} x {height} display, turned)"
+            return DisplayCheck(True, fw, fh, dpi, detail, "")
+        width, height = frame
     detail = (
         f"{width} x {height} at DPI {dpi if dpi is not None else '?'}; "
         f"the farm needs {config.SCREEN_W} x {config.SCREEN_H} at DPI {config.SCREEN_DPI}"

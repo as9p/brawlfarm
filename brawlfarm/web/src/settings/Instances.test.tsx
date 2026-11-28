@@ -151,6 +151,34 @@ describe("Settings > Instances", () => {
     });
   });
 
+  it("keeps the emulator kind config.toml set when a row is edited", async () => {
+    const doc = makeSettings({
+      instances: [
+        { name: "Pie64", adb_port: 5555, player_tag: "#2P0YLQ9" },
+        { name: "Pie64_1", adb_port: 16384, player_tag: "", emulator: "mumu" },
+      ],
+    });
+    const { calls } = server({ doc });
+    mount();
+    const [, mumu] = await rows();
+    await userEvent.click(within(mumu).getByRole("button", { name: "Edit" }));
+
+    const form = screen.getAllByRole("row")[2];
+    await userEvent.clear(within(form).getByLabelText("ADB port"));
+    await userEvent.type(within(form).getByLabelText("ADB port"), "16416");
+    await userEvent.click(within(form).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(puts(calls)).toHaveLength(1);
+    });
+    expect(puts(calls)[0].instances[1]).toEqual({
+      name: "Pie64_1",
+      adb_port: 16416,
+      player_tag: "",
+      emulator: "mumu",
+    });
+  });
+
   it("adds an instance through the same form, as a new last row", async () => {
     const { calls } = server();
     mount();

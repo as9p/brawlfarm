@@ -470,6 +470,8 @@ class Supervisor:
         name = inst.name
         job = self._recycling.get(name)
         if job is None:
+            if inst.emulator != "bluestacks":
+                return None  # the guard restarts HD-Player; a MuMu instance has none
             return self._recycle_trigger(name, now) if want == "run" and alive else None
         if job.resumed and not self._recycle_resume(name, job, now, want):
             return None

@@ -71,7 +71,12 @@ def test_round_trip_preserves_every_field(tmp_path: Path) -> None:
     assert path == tmp_path / "config.toml"
     assert S.load(tmp_path) == original
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    assert raw["instances"][0] == {"name": "Pie64", "adb_port": 5555, "player_tag": "#2P0YLQ9"}
+    assert raw["instances"][0] == {
+        "name": "Pie64",
+        "adb_port": 5555,
+        "player_tag": "#2P0YLQ9",
+        "emulator": "bluestacks",
+    }
     assert raw["app"]["port"] == 9000
 
 
@@ -180,6 +185,7 @@ def test_worker_env_is_the_full_contract(tmp_path: Path) -> None:
         "BRAWLFARM_HOME": str(tmp_path.resolve()),
         "BRAWL_DATA_DIR": "instances/Pie64",
         "BRAWL_ADB_PORT": "5555",
+        "BRAWL_EMULATOR": "bluestacks",
         "BRAWL_PLAYER_TAG": "#2P0YLQ9",
         "BRAWL_ADB_PATH": r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe",
         "BRAWL_API_TOKEN": "tok",

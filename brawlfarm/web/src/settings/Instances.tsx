@@ -143,14 +143,16 @@ export function Instances({ settingsPatch }: { settingsPatch: SettingsPatch }) {
     if (original === null) return;
     const port = Number(draft.adb_port);
     void patch((document) => {
+      const at = document.instances.findIndex((inst) => inst.name === original);
       const row = {
+        // Fields this form does not show (the emulator kind) stay as they were on disk.
+        ...(at < 0 ? {} : document.instances[at]),
         name: draft.name.trim(),
         // A blank or unparseable port goes as 0, which the API answers with a 422 naming
         // adb_port: the model is the validator here, not this form.
         adb_port: Number.isFinite(port) ? port : 0,
         player_tag: draft.player_tag.trim(),
       };
-      const at = document.instances.findIndex((inst) => inst.name === original);
       if (at < 0) document.instances.push(row);
       else document.instances[at] = row;
     })

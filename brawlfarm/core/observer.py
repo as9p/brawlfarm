@@ -104,11 +104,14 @@ class Observer:
 
     def run(self) -> None:
         adb.connect()
+        wrong = adb.emulator_mismatch()
+        if wrong:
+            raise SystemExit(wrong)
         w, h = adb.screen_size()
         if (w, h) != (config.SCREEN_W, config.SCREEN_H):
             raise SystemExit(
                 f"Display is {w}x{h}, expected {config.SCREEN_W}x{config.SCREEN_H}. "
-                f"Lock BlueStacks resolution before recording."
+                f"Lock the emulator's resolution before recording."
             )
         # A leftover stop.flag belongs to the worker that stopped before this one, and
         # whoever launched us wants us running.
