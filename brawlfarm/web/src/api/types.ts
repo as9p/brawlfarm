@@ -285,7 +285,13 @@ export interface AppSettings {
     healthchecks_url: string;
     events: string[];
   };
-  instances: { name: string; adb_port: number; player_tag: string }[];
+  instances: {
+    name: string;
+    adb_port: number;
+    player_tag: string;
+    /** Set in config.toml; the panel shows no control for it but must keep it. */
+    emulator?: "bluestacks" | "mumu";
+  }[];
 }
 
 /** One row of POST /api/setup/scan: a BlueStacks instance as bluestacks.conf describes it,

@@ -87,6 +87,9 @@ class InstanceSettings(_Section):
     name: str
     adb_port: int = Field(ge=1, le=65535)
     player_tag: str = ""  # optional; only used for the Brawl Stars API
+    # BlueStacks 5 or MuMu Player 12. It picks the touch path the worker uses, and the
+    # supervisor's HD-Player restart guard only ever acts on BlueStacks instances.
+    emulator: Literal["bluestacks", "mumu"] = "bluestacks"
 
     @field_validator("name")
     @classmethod
@@ -215,6 +218,7 @@ def worker_env(settings: AppSettings, inst: InstanceSettings, home: Path) -> dic
         "BRAWLFARM_HOME": str(Path(home).resolve()),
         "BRAWL_DATA_DIR": f"instances/{inst.name}",
         "BRAWL_ADB_PORT": str(inst.adb_port),
+        "BRAWL_EMULATOR": inst.emulator,
         "BRAWL_PLAYER_TAG": inst.player_tag,
         "BRAWL_ADB_PATH": c.adb_path,
         "BRAWL_API_TOKEN": c.brawl_api_token,

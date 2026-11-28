@@ -26,6 +26,7 @@ def data(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setattr(config, "DATA_DIR", inst)
     monkeypatch.setattr(observer, "POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(adb, "connect", lambda serial=None: None)
+    monkeypatch.setattr(adb, "emulator_mismatch", lambda: None)
     monkeypatch.setattr(adb, "screen_size", lambda: (config.SCREEN_W, config.SCREEN_H))
     monkeypatch.setattr(adb, "screencap", lambda serial=None: _frame())
     return inst

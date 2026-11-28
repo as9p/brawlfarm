@@ -2032,12 +2032,16 @@ class Controller:
 
     def run(self) -> None:
         adb.connect()
+        wrong = adb.emulator_mismatch()
+        if wrong:
+            self.dl.event("emulator_mismatch_error", expected=config.EMULATOR)
+            raise SystemExit(wrong)
         w, h = adb.screen_size()
         if (w, h) != (config.SCREEN_W, config.SCREEN_H):
             self.dl.event("bad_resolution", got=[w, h])
             raise SystemExit(
                 f"Display is {w}x{h}, expected {config.SCREEN_W}x{config.SCREEN_H}. "
-                f"Lock BlueStacks resolution before running."
+                f"Lock the emulator's resolution before running."
             )
         self.dl.event("start", max_games=self.max_games, max_minutes=self.max_minutes)
         self.log(f"started. session log -> {self.dl.session_path.name}")

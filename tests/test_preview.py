@@ -137,6 +137,7 @@ def _one_iteration_controller(monkeypatch, frame) -> Controller:
     tests/test_network_stuck.py pattern: __new__ plus the attributes the loop reads, every
     seam stubbed). The phase handler ends the run, so the loop never comes round again."""
     monkeypatch.setattr(controller_mod.adb, "connect", lambda *a, **kw: None)
+    monkeypatch.setattr(controller_mod.adb, "emulator_mismatch", lambda: None)
     monkeypatch.setattr(
         controller_mod.adb, "screen_size", lambda: (config.SCREEN_W, config.SCREEN_H)
     )

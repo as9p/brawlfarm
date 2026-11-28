@@ -140,6 +140,45 @@ def test_display_check_passes_at_the_resolution_the_controller_asserts() -> None
     assert result.hint == ""
 
 
+def _portrait_runner(frame: bytes) -> RecordingRunner:
+    """MuMu: wm size answers the natural portrait size, the frame comes out landscape."""
+    return RecordingRunner(
+        {
+            "connect": _done(["adb", "connect"], out=b"connected\n"),
+            "wm size": _done(["adb", "wm", "size"], out=b"Physical size: 900x1600\n"),
+            "wm density": _done(["adb", "wm", "density"], out=b"Physical density: 240\n"),
+            "screencap": _done(["adb", "screencap"], out=frame),
+        }
+    )
+
+
+def test_display_check_passes_a_portrait_display_turned_to_landscape() -> None:
+    result = checks.display_check(
+        "C:/tools/adb.exe", 16384, runner=_portrait_runner(_png(1600, 900))
+    )
+    assert result.ok is True
+    assert (result.width, result.height, result.dpi) == (1600, 900, 240)
+    assert "900 x 1600" in result.detail
+    assert result.hint == ""
+
+
+def test_display_check_fails_a_portrait_display_left_portrait() -> None:
+    result = checks.display_check(
+        "C:/tools/adb.exe", 16384, runner=_portrait_runner(_png(900, 1600))
+    )
+    assert result.ok is False
+    assert (result.width, result.height) == (900, 1600)
+    assert result.hint == checks.DISPLAY_HINT
+
+
+def test_display_check_fails_a_portrait_display_whose_frame_cannot_be_read() -> None:
+    result = checks.display_check(
+        "C:/tools/adb.exe", 16384, runner=_portrait_runner(b"error: closed")
+    )
+    assert result.ok is False
+    assert "did not return a PNG" in result.detail
+
+
 def test_display_check_explains_a_mismatch_and_where_to_fix_it() -> None:
     runner = RecordingRunner(
         {

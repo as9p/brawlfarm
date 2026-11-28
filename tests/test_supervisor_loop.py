@@ -625,6 +625,17 @@ def test_guard_needs_a_player_to_restart(tmp_path, world) -> None:
     assert not (S.instance_dir(tmp_path, "Pie64") / "stop.flag").exists()
 
 
+def test_guard_never_acts_on_a_mumu_instance(tmp_path, world) -> None:
+    """Even with an HD-Player of the same name over the limit: MuMu has no HD-Player."""
+    sup = _guarded(tmp_path, world)
+    sup.settings.instances[0].emulator = "mumu"
+    sup.apply_settings(sup.settings)
+    world.player_gb = 41.0
+    assert _view(sup.tick(), "Pie64").state == InstanceState.FARMING
+    assert not (S.instance_dir(tmp_path, "Pie64") / "stop.flag").exists()
+    assert world.closes == []
+
+
 def test_guard_ignores_a_failed_commit_read(tmp_path, world) -> None:
     sup = _guarded(tmp_path, world, recycle_gb=0.0, floor_gb=12.0)
     world.player_gb = 41.0
