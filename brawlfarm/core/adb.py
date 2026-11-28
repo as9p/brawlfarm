@@ -14,6 +14,7 @@ have multiple BlueStacks instances open.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import struct
 import subprocess
@@ -210,12 +211,15 @@ def screencap(serial: str | None = None) -> np.ndarray:
 # no usable touch node, so this session stays on `adb shell input`.
 _touch_profile: touch.TouchProfile | None | bool = None
 _rotation_read_at = 0.0
+# When the last `getevent -p` failed, so a device that keeps failing costs one extra adb
+# call per config.TOUCH_PROFILE_RETRY_S, not one per tap.
+_profile_failed_at: float | None = None
 
 
 def reset_touch_profile() -> None:
     """Forget the touch profile so the next input reads the device again."""
-    global _touch_profile, _rotation_read_at
-    _touch_profile, _rotation_read_at = None, 0.0
+    global _touch_profile, _rotation_read_at, _profile_failed_at
+    _touch_profile, _rotation_read_at, _profile_failed_at = None, 0.0, None
 
 
 def input_nodes() -> list[touch.InputNode]:
@@ -234,7 +238,7 @@ def display_rotation() -> int | None:
 
 def _profile() -> touch.TouchProfile | None:
     """The touch profile to write with, or None to use `adb shell input` instead."""
-    global _touch_profile, _rotation_read_at
+    global _touch_profile, _rotation_read_at, _profile_failed_at
     if config.EMULATOR == "bluestacks":
         return touch.bluestacks_profile(
             config.TOUCH_DEVICE,
@@ -245,10 +249,16 @@ def _profile() -> touch.TouchProfile | None:
         )
     now = time.monotonic()
     if _touch_profile is None:
+        if _profile_failed_at is not None and now - _profile_failed_at < (
+            config.TOUCH_PROFILE_RETRY_S
+        ):
+            return None
         try:
             node = touch.pick_touch_node(input_nodes())
         except AdbError:
-            return None  # read again on the next input
+            _profile_failed_at = now  # read again once the retry wait is over
+            return None
+        _profile_failed_at = None
         if node is None:
             _touch_profile = False
             return None
@@ -291,7 +301,12 @@ def tap(x: int, y: int) -> None:
                     _write_touch(prof.down(x, y), prof.device, prof.up())
                 return
             except AdbError:
-                pass  # fall back to the slow-but-sure path
+                if prof.protocol == "b":
+                    # The call may have died between down and up: lift the slot so no
+                    # finger stays held through the fallback tap.
+                    with contextlib.suppress(AdbError):
+                        _write_touch(prof.up(), prof.device)
+                # fall back to the slow-but-sure path
     _run(["-s", config.ADB_SERIAL, "shell", "input", "tap", str(int(x)), str(int(y))])
 
 
@@ -466,7 +481,9 @@ def screen_size() -> tuple[int, int]:
     for token in out.replace("\n", " ").split():
         if "x" in token and token.replace("x", "").isdigit():
             w, h = (int(v) for v in token.split("x"))
-            if h > w:
+            if h > w and config.EMULATOR == "mumu":
+                # Only MuMu: a BlueStacks instance set to portrait must still fail the
+                # startup check rather than be excused by its frame.
                 frame = screencap()
                 return int(frame.shape[1]), int(frame.shape[0])
             return w, h

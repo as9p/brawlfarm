@@ -216,6 +216,49 @@ def test_mumu_without_a_touch_node_falls_back_to_input_tap(fake_adb) -> None:
     assert sum("getevent" in " ".join(c) for c in calls) == 1  # not re-read every tap
 
 
+def test_a_failing_touch_node_read_is_retried_only_after_a_wait(fake_adb, monkeypatch) -> None:
+    _, calls = fake_adb
+    clock = [1000.0]
+    monkeypatch.setattr(adb.time, "monotonic", lambda: clock[0])
+    real_run = adb._run
+
+    def failing_getevent(args, **kwargs):
+        if "getevent" in args:
+            calls.append(list(args))
+            raise adb.AdbError("device offline")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(adb, "_run", failing_getevent)
+    adb.tap(750, 66)
+    adb.tap(751, 66)
+    assert sum("getevent" in c for c in calls) == 1  # the second tap did not ask again
+    assert calls[-1] == ["-s", "127.0.0.1:16384", "shell", "input", "tap", "751", "66"]
+    clock[0] += config.TOUCH_PROFILE_RETRY_S + 1
+    adb.tap(752, 66)
+    assert sum("getevent" in c for c in calls) == 2
+
+
+def test_a_failed_type_b_tap_lifts_the_finger_before_the_fallback(fake_adb, monkeypatch) -> None:
+    _, calls = fake_adb
+    adb.tap(1, 1)  # read the profile
+    real_run = adb._run
+    first = [True]
+
+    def die_mid_tap(args, **kwargs):
+        if "sleep" in args[-1] and first[0]:
+            first[0] = False
+            calls.append(list(args))
+            raise adb.AdbError("timed out")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(adb, "_run", die_mid_tap)
+    calls.clear()
+    adb.tap(750, 66)
+    up = f"printf '{_octal(_mumu_profile().up())}' > /dev/input/event4"
+    assert calls[1] == ["-s", "127.0.0.1:16384", "shell", up]
+    assert calls[2] == ["-s", "127.0.0.1:16384", "shell", "input", "tap", "750", "66"]
+
+
 def test_bluestacks_tap_sends_the_same_command_as_before(fake_adb, monkeypatch) -> None:
     _, calls = fake_adb
     monkeypatch.setattr(config, "EMULATOR", "bluestacks")
@@ -282,6 +325,10 @@ def test_screen_size_turns_a_portrait_display_by_its_frame(fake_adb, monkeypatch
     assert adb.screen_size() == (1600, 900)
     answers["wm"] = "Physical size: 1600x900\n"
     assert adb.screen_size() == (1600, 900)
+    # A BlueStacks instance left portrait is reported as it is, so the startup check fails.
+    monkeypatch.setattr(config, "EMULATOR", "bluestacks")
+    answers["wm"] = "Physical size: 900x1600\n"
+    assert adb.screen_size() == (900, 1600)
 
 
 def test_mumu_defaults_to_port_16384() -> None:

@@ -137,6 +137,7 @@ TOUCH_DEVICE = "/dev/input/event4"  # the "BlueStacks Virtual Touch" node
 TOUCH_MAX_X = 32767  # ABS_MT_POSITION_X max (taps scale pixel_x/SCREEN_W*this)
 TOUCH_MAX_Y = 32767  # ABS_MT_POSITION_Y max
 TOUCH_ROTATION_TTL_S = 60.0  # re-read the display rotation this often (MuMu)
+TOUCH_PROFILE_RETRY_S = 30.0  # after a failed touch-node read, wait this long (MuMu)
 TOUCH_HOLD_S = 0.05  # type B tap: finger down this long before up, in the same shell call
 
 
